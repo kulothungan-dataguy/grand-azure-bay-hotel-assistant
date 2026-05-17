@@ -1,0 +1,200 @@
+import hashlib
+import diskcache
+from app.graph.state import AssistantState
+from app.llm.provider import get_llm
+
+_rag_cache = diskcache.Cache(".rag_cache")
+from app.llm.config import OLLAMA_MODEL
+from app.rag.retriever import retriever
+from app.rag.prompts import RAG_PROMPT
+from app.rag.intent_prompt import INTENT_PROMPT
+from app.rag.extraction_prompt import EXTRACTION_PROMPT
+from app.schemas.intent_schema import IntentOutput, ReservationIDOutput
+from app.schemas.reservation_schema import ReservationData
+from app.tools.reservation_tools import (
+    create_reservation_tool,
+    view_reservation_tool,
+    cancel_reservation_tool,
+)
+from app.utils.logger import logger
+
+
+llm = get_llm()
+
+
+def intent_router_node(state: AssistantState):
+    query = state["query"]
+    chat_history = state.get("chat_history", [])
+
+    prompt = INTENT_PROMPT.format(chat_history=chat_history, query=query)
+    structured_llm = llm.with_structured_output(IntentOutput)
+    result = structured_llm.invoke(prompt)
+
+    return {"intent": result.intent}
+
+
+def rag_node(state: AssistantState):
+    query = state["query"]
+    cache_key = hashlib.md5(query.lower().strip().encode()).hexdigest()
+
+    if cache_key in _rag_cache:
+        logger.info(f"RAG cache hit for: {query}")
+        cached = _rag_cache[cache_key]
+        return {"retrieved_context": cached["context"], "response": cached["response"]}
+
+    docs = retriever.invoke(query)
+    context = "\n\n".join(doc.page_content for doc in docs)
+    prompt = RAG_PROMPT.format(context=context, question=query)
+
+    try:
+        response = llm.invoke(prompt)
+    except Exception as e:
+        logger.error(f"Primary LLM failed: {e}")
+        from langchain_ollama import ChatOllama
+        fallback_llm = ChatOllama(model=OLLAMA_MODEL)
+        response = fallback_llm.invoke(prompt)
+
+    _rag_cache.set(cache_key, {"context": context, "response": response.content}, expire=86400)
+
+    return {
+        "retrieved_context": context,
+        "response": response.content
+    }
+
+
+def _extract_lookup_info(query: str, chat_history: list) -> ReservationIDOutput:
+    prompt = (
+        f"Extract the reservation ID and email address from the user's message.\n\n"
+        f"Chat history: {chat_history}\n"
+        f"User query: {query}\n\n"
+        "Return the integer reservation ID if mentioned, the email if mentioned, or null for either if not found."
+    )
+    structured_llm = llm.with_structured_output(ReservationIDOutput)
+    return structured_llm.invoke(prompt)
+
+
+_FIELD_LABELS = {
+    "guest_name":     "your full name",
+    "email":          "your email address",
+    "room_type":      "the room type (e.g. Standard, Deluxe, Suite)",
+    "check_in_date":  "your check-in date",
+    "check_out_date": "your check-out date",
+}
+
+
+def _missing_fields_response(data: dict) -> str | None:
+    missing = [label for field, label in _FIELD_LABELS.items() if not data.get(field)]
+    if not missing:
+        return None
+    if len(missing) == 1:
+        return f"Sure! Could you also share {missing[0]} so I can complete your booking?"
+    listed = ", ".join(missing[:-1]) + f" and {missing[-1]}"
+    return f"I'd love to help you book a room! Could you please share {listed}?"
+
+
+def tool_node(state: AssistantState):
+
+    intent = state["intent"]
+    query = state["query"]
+    chat_history = state.get("chat_history", [])
+
+    if intent == "create_reservation":
+        data = state["reservation_data"]
+
+        ask = _missing_fields_response(data)
+        if ask:
+            return {"response": ask}
+
+        result = create_reservation_tool(
+            guest_name=data["guest_name"],
+            email=data["email"],
+            room_type=data["room_type"],
+            check_in_date=data["check_in_date"],
+            check_out_date=data["check_out_date"]
+        )
+
+        return {
+            "response": result["message"],
+            "reservation_id": result["reservation_id"]
+        }
+
+    elif intent == "view_reservation":
+
+        lookup = _extract_lookup_info(query, chat_history)
+
+        if lookup.reservation_id is None:
+            return {"response": "Please provide your reservation ID so I can look it up."}
+
+        # fall back to session email if not in query
+        email = lookup.email or (
+            state.get("current_reservation") or {}
+        ).get("email")
+
+        if not email:
+            return {"response": "Please provide your email address to verify ownership."}
+
+        response = view_reservation_tool(
+            reservation_id=lookup.reservation_id,
+            requester_email=email
+        )
+
+    elif intent == "cancel_reservation":
+
+        lookup = _extract_lookup_info(query, chat_history)
+
+        if lookup.reservation_id is None:
+            return {"response": "Please provide your reservation ID so I can cancel it."}
+
+        email = lookup.email or (
+            state.get("current_reservation") or {}
+        ).get("email")
+
+        if not email:
+            return {"response": "Please provide your email address to verify ownership."}
+
+        response = cancel_reservation_tool(
+            reservation_id=lookup.reservation_id,
+            requester_email=email
+        )
+
+    else:
+
+        response = "Unsupported operation"
+
+    return {
+        "response": str(response)
+    }
+
+
+def reject_node(state: AssistantState):
+    return {
+        "response": "Access denied"
+    }
+
+
+def extract_reservation_node(state: AssistantState):
+    query = state["query"]
+    chat_history = state.get("chat_history", [])
+
+    prompt = EXTRACTION_PROMPT.format(
+        chat_history=chat_history,
+        query=query
+    )
+
+    structured_llm = llm.with_structured_output(ReservationData)
+    extracted_data = structured_llm.invoke(prompt)
+
+    existing_reservation = state.get("current_reservation")
+    new_data = extracted_data.model_dump()
+
+    if existing_reservation:
+        merged_data = {
+            **existing_reservation,
+            **{k: v for k, v in new_data.items() if v is not None}
+        }
+    else:
+        merged_data = new_data
+
+    return {
+        "reservation_data": merged_data
+    }
