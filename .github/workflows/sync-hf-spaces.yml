@@ -1,0 +1,47 @@
+name: Sync to HF Spaces
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  sync-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge master into hf-backend and push to HF
+        run: |
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git fetch origin
+          git checkout hf-backend
+          git merge origin/master --no-edit -X ours
+          git push origin hf-backend
+          git remote add hf https://Real-Kulothungan:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/Real-Kulothungan/grand-azure-bay-api
+          git push hf hf-backend:main --force
+
+  sync-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge master into hf-frontend and push to HF
+        run: |
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git fetch origin
+          git checkout hf-frontend
+          git merge origin/master --no-edit -X ours
+          git push origin hf-frontend
+          git remote add hf https://Real-Kulothungan:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/Real-Kulothungan/grand-azure-bay
+          git push hf hf-frontend:main --force
