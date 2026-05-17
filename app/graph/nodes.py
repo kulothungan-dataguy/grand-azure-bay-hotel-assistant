@@ -122,35 +122,36 @@ def tool_node(state: AssistantState):
 
         lookup = _extract_lookup_info(query, chat_history)
 
-        if lookup.reservation_id is None:
-            return {"response": "Please provide your reservation ID so I can look it up."}
-
-        # fall back to session email if not in query
         email = lookup.email or (
             state.get("current_reservation") or {}
         ).get("email")
 
-        if not email:
-            return {"response": "Please provide your email address to verify ownership."}
+        if not email and lookup.reservation_id is None:
+            return {"response": "Please share your email address or reservation ID so I can look up your reservation."}
 
-        response = view_reservation_tool(
+        result = view_reservation_tool(
             reservation_id=lookup.reservation_id,
             requester_email=email
         )
+
+        if isinstance(result, dict) and "reservation_list" in result:
+            return {
+                "response": f"Here are your reservations:\n{result['summary']}",
+                "reservation_list": result["reservation_list"]
+            }
+
+        response = result
 
     elif intent == "cancel_reservation":
 
         lookup = _extract_lookup_info(query, chat_history)
 
-        if lookup.reservation_id is None:
-            return {"response": "Please provide your reservation ID so I can cancel it."}
-
         email = lookup.email or (
             state.get("current_reservation") or {}
         ).get("email")
 
-        if not email:
-            return {"response": "Please provide your email address to verify ownership."}
+        if not email and lookup.reservation_id is None:
+            return {"response": "Please share your email address or reservation ID so I can cancel your reservation."}
 
         response = cancel_reservation_tool(
             reservation_id=lookup.reservation_id,
@@ -164,6 +165,19 @@ def tool_node(state: AssistantState):
     return {
         "response": str(response)
     }
+
+
+def general_node(state: AssistantState):
+    query = state["query"]
+    chat_history = state.get("chat_history", [])
+    prompt = (
+        f"You are a friendly hotel concierge assistant for Grand Azure Bay Hotel. "
+        f"Respond naturally to the guest's message.\n\n"
+        f"Chat history: {chat_history}\n"
+        f"Guest: {query}\nAssistant:"
+    )
+    response = llm.invoke(prompt)
+    return {"response": response.content}
 
 
 def reject_node(state: AssistantState):

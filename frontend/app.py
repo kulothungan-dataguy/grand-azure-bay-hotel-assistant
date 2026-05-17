@@ -116,6 +116,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "pending_query" not in st.session_state:
     st.session_state.pending_query = None
+if "reservation_list" not in st.session_state:
+    st.session_state.reservation_list = []
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -191,6 +193,8 @@ def send(query: str):
         st.markdown(query)
 
     with st.chat_message("assistant", avatar="🏨"):
+        placeholder = st.empty()
+        placeholder.markdown("*Arranging your experience at Grand Azure Bay...*")
         try:
             with requests.post(
                 f"{API_URL}/chat/stream",
@@ -202,6 +206,7 @@ def send(query: str):
                 timeout=60,
             ) as res:
                 res.raise_for_status()
+                placeholder.empty()
 
                 def token_generator():
                     for chunk in res.iter_content(chunk_size=None):
@@ -212,6 +217,7 @@ def send(query: str):
                 rid = None
 
         except requests.exceptions.ConnectionError:
+            placeholder.empty()
             reply = "Cannot reach the hotel server. Please ensure the API is running."
             st.markdown(reply)
             rid = None
@@ -221,6 +227,27 @@ def send(query: str):
                 f'<span class="res-pill">Reservation ID: {rid}</span>',
                 unsafe_allow_html=True,
             )
+
+        # Contextual room type buttons
+        if reply and "room type" in reply.lower():
+            st.markdown("**Select a room type:**")
+            cols = st.columns(3)
+            for i, room in enumerate(["Standard", "Deluxe", "Suite"]):
+                if cols[i].button(room, key=f"room_{room}_{len(st.session_state.messages)}"):
+                    st.session_state.pending_query = room
+
+        # Reservation list — parse IDs from response and show Cancel buttons
+        if reply and "here are your reservations" in reply.lower():
+            import re
+            res_ids = re.findall(r"#(\d+)", reply)
+            if res_ids:
+                st.markdown("**Actions:**")
+                for res_id in res_ids:
+                    if st.button(
+                        f"Cancel Reservation #{res_id}",
+                        key=f"cancel_{res_id}_{len(st.session_state.messages)}"
+                    ):
+                        st.session_state.pending_query = f"Cancel reservation {res_id}"
 
     st.session_state.messages.append({
         "role": "assistant",
