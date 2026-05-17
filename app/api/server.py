@@ -49,9 +49,7 @@ def chat(
     "content": query
     })
 
-    logger.info(conversation_memory)
-    # print(f"conversation_memory: {conversation_memory[conversation_id]}")
-    # query = payload.query
+    logger.info(f"Conversation {conversation_id}: {len(conversation_memory[conversation_id]['chat_history'])} turns")
 
     response = graph.invoke({
 
