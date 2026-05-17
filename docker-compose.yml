@@ -2,7 +2,7 @@ services:
   api:
     build: .
     ports:
-      - "8000:8000"
+      - "8000:7860"
     env_file: .env
     environment:
       - DATABASE_PATH=/var/data/hotel.db

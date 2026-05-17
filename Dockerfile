@@ -9,6 +9,6 @@ COPY . .
 
 RUN python -m app.rag.ingest
 
-EXPOSE 8000
+EXPOSE 7860
 
-CMD ["uvicorn", "app.api.server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.api.server:app", "--host", "0.0.0.0", "--port", "7860"]
