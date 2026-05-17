@@ -1,16 +1,21 @@
 import os
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
 from app.llm.config import OLLAMA_MODEL, OPENAI_MODEL
+
+try:
+    from langchain_groq import ChatGroq
+    _has_groq = True
+except ImportError:
+    _has_groq = False
 
 load_dotenv()
 
 
 class FallbackLLM:
     def __init__(self):
-        if os.getenv("GROQ_API_KEY"):
+        if _has_groq and os.getenv("GROQ_API_KEY"):
             self.primary_llm = ChatGroq(
                 model="llama-3.1-8b-instant",
                 api_key=os.environ["GROQ_API_KEY"],
