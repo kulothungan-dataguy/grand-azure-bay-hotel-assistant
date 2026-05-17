@@ -1,9 +1,11 @@
 ---
-title: Grand Azure Bay API
+title: Grand Azure Bay
 emoji: 🏨
 colorFrom: blue
 colorTo: yellow
-sdk: docker
+sdk: streamlit
+sdk_version: 1.57.0
+app_file: frontend/app.py
 pinned: false
 ---
 
