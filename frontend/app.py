@@ -66,21 +66,29 @@ st.markdown("""
         border-radius: 8px !important;
     }
 
-    /* Quick question buttons */
+    /* Quick question buttons — sidebar (dark bg) */
+    [data-testid="stSidebar"] .stButton > button {
+        background: rgba(255, 255, 255, 0.12) !important;
+        color: #e2e8f0 !important;
+        border: 1.5px solid rgba(255, 255, 255, 0.35) !important;
+        border-radius: 8px !important;
+        font-size: 0.82rem !important;
+        width: 100% !important;
+        text-align: left !important;
+        padding: 0.45rem 0.75rem !important;
+        transition: all 0.15s !important;
+    }
+    [data-testid="stSidebar"] .stButton > button:hover {
+        background: rgba(255, 255, 255, 0.25) !important;
+        color: #ffffff !important;
+    }
+
+    /* Clear button */
     .stButton > button {
-        background: white;
-        color: #1a365d;
-        border: 1.5px solid #1a365d;
         border-radius: 8px;
         font-size: 0.82rem;
         width: 100%;
-        text-align: left;
-        padding: 0.45rem 0.75rem;
         transition: all 0.15s;
-    }
-    .stButton > button:hover {
-        background: #1a365d;
-        color: white;
     }
 
     /* Reservation ID pill */
