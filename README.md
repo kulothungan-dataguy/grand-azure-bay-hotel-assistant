@@ -2,7 +2,7 @@
 title: Grand Azure Bay API
 emoji: 🏨
 colorFrom: blue
-colorTo: orange
+colorTo: yellow
 sdk: docker
 pinned: false
 ---
