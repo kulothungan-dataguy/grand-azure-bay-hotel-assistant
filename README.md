@@ -187,7 +187,7 @@ Currently only user messages are stored in chat history — the assistant's resp
 Since the last completed booking is already in session state, the booking form could pre-fill the guest name and room type from the previous reservation. The guest only needs to change what's different (e.g. new dates). This is particularly useful for repeat guests who book the same room type regularly.
 
 **Redis-backed session store**
-The current in-memory `conversation_memory` dict resets on every server restart, losing all active sessions. Replacing it with Redis would make sessions persistent across deployments and support horizontal scaling (multiple server instances sharing the same session state).
+RAG responses are already cached on disk (diskcache, 24 h TTL). What is not persistent is the conversation session state — the `conversation_memory` dict (chat history, current reservation progress, user email) lives in Python memory and resets on every server restart, dropping active conversations. Replacing it with Redis would make sessions survive restarts and support horizontal scaling where multiple server instances need to share the same session state.
 
 **Room availability and pricing in knowledge base**
 The bot currently cannot answer "What are the room rates?" because pricing is not in the hotel document. Adding a structured rates table to the knowledge base (or a separate `/rates` endpoint backed by a DB table) would eliminate the most common escalation trigger.
