@@ -57,6 +57,19 @@ def get_reservation(reservation_id):
     return reservation
 
 
+def get_reservations_by_email(email):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT * FROM reservations
+    WHERE LOWER(email) = LOWER(?)
+    ORDER BY reservation_id
+    """, (email,))
+    reservations = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in reservations]
+
+
 def cancel_reservation(reservation_id):
 
     conn = get_connection()

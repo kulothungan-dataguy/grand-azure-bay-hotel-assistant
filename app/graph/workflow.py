@@ -5,17 +5,18 @@ from app.graph.nodes import (
     rag_node,
     tool_node,
     reject_node,
+    general_node,
     extract_reservation_node
 )
 from app.graph.router import route_intent
 
 
 builder = StateGraph(AssistantState)
-# print(builder)
 
 builder.add_node("intent_router", intent_router_node)
 builder.add_node("rag_node", rag_node)
 builder.add_node("tool_node", tool_node)
+builder.add_node("general_node", general_node)
 builder.add_node("reject_node", reject_node)
 builder.add_node(
     "extract_reservation",
@@ -30,6 +31,7 @@ builder.add_edge(
     "extract_reservation",
     "tool_node"
 )
+builder.add_edge("general_node", END)
 builder.add_edge("rag_node", END)
 builder.add_edge("tool_node", END)
 builder.add_edge("reject_node", END)

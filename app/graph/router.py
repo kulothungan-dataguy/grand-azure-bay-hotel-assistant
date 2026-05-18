@@ -21,6 +21,10 @@ def route_intent(state: AssistantState):
     ]:
 
         return "tool_node"
+    
+    elif intent == "general_interactions":
+
+        return "general_node"
 
     else:
 
