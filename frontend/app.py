@@ -149,6 +149,8 @@ if "cancel_res_ids" not in st.session_state:
     st.session_state.cancel_res_ids = []
 if "user_email" not in st.session_state:
     st.session_state.user_email = None
+if "escalate_query" not in st.session_state:
+    st.session_state.escalate_query = None
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -249,6 +251,7 @@ for msg in st.session_state.messages:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 _BOOKING_TRIGGERS = ["full name", "check-in date", "check-out date", "email address"]
+_ESCALATION_TRIGGERS = ["i don't have that information", "please contact our front desk", "contact our front desk"]
 
 def _is_booking_ask(text: str) -> bool:
     lower = text.lower()
@@ -318,11 +321,19 @@ def send(query: str):
     # Show booking form when bot asks for reservation details
     st.session_state.show_booking_form = _is_booking_ask(reply)
 
-    # Show cancel buttons only when user explicitly asked to cancel
-    if _is_cancel_query(query) and "reservation" in reply.lower():
+    # Show cancel buttons only when listing reservations, NOT when asking for confirmation
+    is_confirmation_prompt = "are you sure you want to cancel" in (reply or "").lower()
+    if _is_cancel_query(query) and "reservation" in reply.lower() and not is_confirmation_prompt:
         st.session_state.cancel_res_ids = re.findall(r"#(\d+)", reply)
     else:
         st.session_state.cancel_res_ids = []
+
+    # Show escalation button when bot couldn't answer
+    reply_lower = (reply or "").lower()
+    if any(t in reply_lower for t in _ESCALATION_TRIGGERS):
+        st.session_state.escalate_query = query
+    else:
+        st.session_state.escalate_query = None
 
 
 # ── Handle pending queries (sidebar clicks) ───────────────────────────────────
@@ -367,6 +378,31 @@ if st.session_state.show_booking_form:
                 f"room type {room_type}, check-in {check_in}, check-out {check_out}"
             )
             st.rerun()
+
+
+# ── Escalation button (when bot couldn't answer) ──────────────────────────────
+if st.session_state.escalate_query:
+    st.markdown("---")
+    st.markdown("#### Need more help?")
+    st.markdown("Our team can answer this question directly.")
+    if st.button("📩 Ask a Human", key="escalate_btn", type="primary"):
+        try:
+            resp = requests.post(
+                f"{API_URL}/escalate",
+                json={
+                    "conversation_id": st.session_state.conversation_id,
+                    "query": st.session_state.escalate_query,
+                    "guest_email": st.session_state.user_email,
+                },
+                timeout=10,
+            )
+            if resp.status_code == 201:
+                st.success("Your question has been sent to our team. We'll get back to you shortly!")
+                st.session_state.escalate_query = None
+            else:
+                st.error("Could not reach the hotel team. Please try again.")
+        except requests.exceptions.ConnectionError:
+            st.error("Cannot reach the server.")
 
 
 # ── Cancel buttons (only on explicit cancel intent) ───────────────────────────

@@ -70,6 +70,45 @@ def get_reservations_by_email(email):
     return [dict(r) for r in reservations]
 
 
+def create_escalation(conversation_id: str, query: str, guest_email: str = None) -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO escalations (conversation_id, guest_email, query)
+    VALUES (?, ?, ?)
+    """, (conversation_id, guest_email, query))
+    conn.commit()
+    escalation_id = cursor.lastrowid
+    conn.close()
+    return escalation_id
+
+
+def get_pending_escalations() -> list:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT * FROM escalations
+    WHERE status = 'PENDING'
+    ORDER BY created_at DESC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def resolve_escalation(escalation_id: int) -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    UPDATE escalations SET status = 'RESOLVED'
+    WHERE id = ?
+    """, (escalation_id,))
+    conn.commit()
+    found = cursor.rowcount > 0
+    conn.close()
+    return found
+
+
 def cancel_reservation(reservation_id):
 
     conn = get_connection()
