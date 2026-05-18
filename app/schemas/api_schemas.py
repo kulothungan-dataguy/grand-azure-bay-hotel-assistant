@@ -16,3 +16,9 @@ class ChatResponse(BaseModel):
     intent: str
 
     reservation_id: Optional[int] = None
+
+
+class EscalationRequest(BaseModel):
+    conversation_id: str
+    query: str
+    guest_email: Optional[str] = None

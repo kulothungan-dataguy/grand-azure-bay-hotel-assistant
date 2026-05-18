@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
 
@@ -17,8 +18,9 @@ from app.rag.prompts import RAG_PROMPT
 from app.rag.intent_prompt import INTENT_PROMPT
 from app.schemas.intent_schema import IntentOutput
 from app.db.models import create_tables
+from app.db.operations import create_escalation, get_pending_escalations, resolve_escalation
 from app.utils.logger import logger
-from app.schemas.api_schemas import ChatRequest, ChatResponse
+from app.schemas.api_schemas import ChatRequest, ChatResponse, EscalationRequest
 from app.memory.store import conversation_memory
 from app.cache.store import rag_cache as _rag_cache
 from app.llm.provider import fallback_stats
@@ -63,8 +65,40 @@ def _get_or_init_memory(conversation_id: str) -> dict:
         conversation_memory[conversation_id] = {
             "chat_history": [],
             "current_reservation": None,
+            "pending_cancel": None,
         }
     return conversation_memory[conversation_id]
+
+
+_CONFIRM = {"yes", "yeah", "yep", "sure", "confirm", "confirmed", "ok", "okay", "proceed", "do it", "go ahead", "yes please"}
+_DENY    = {"no", "nope", "don't", "dont", "stop", "abort", "never mind", "nevermind", "keep it", "cancel that"}
+
+
+def _is_confirmation(query: str) -> bool:
+    q = query.lower().strip().rstrip(".")
+    return q in _CONFIRM or any(w in q for w in ["yes", "confirm", "proceed", "sure", "go ahead"])
+
+
+def _is_denial(query: str) -> bool:
+    q = query.lower().strip()
+    return q in _DENY or any(w in q for w in ["no", "don't", "abort", "never mind", "stop", "keep"])
+
+
+def _extract_pending_cancel(response: dict, memory: dict) -> dict | None:
+    """
+    Primary: use graph state if it returned pending_cancel.
+    Fallback: detect the confirmation prompt from response text so the server
+    sets pending_cancel even if LangGraph doesn't propagate the field cleanly.
+    """
+    if response.get("pending_cancel"):
+        return response["pending_cancel"]
+    reply_text = response.get("response", "") or ""
+    if "are you sure you want to cancel" in reply_text.lower():
+        id_match = re.search(r"Reservation #(\d+)", reply_text)
+        email = memory.get("user_email") or (memory.get("current_reservation") or {}).get("email")
+        if id_match and email:
+            return {"reservation_id": int(id_match.group(1)), "email": email}
+    return None
 
 
 def _log_drift(intent: str, query_len: int) -> None:
@@ -93,6 +127,23 @@ def chat(payload: ChatRequest):
         },
     )
 
+    # Intercept cancellation confirmation before invoking the graph
+    pending = memory.get("pending_cancel")
+    if pending:
+        if _is_confirmation(query):
+            from app.tools.reservation_tools import cancel_reservation_tool
+            result = cancel_reservation_tool(pending["reservation_id"], pending["email"])
+            memory["pending_cancel"] = None
+            _log_drift("cancel_reservation", len(query))
+            return ChatResponse(response=str(result), intent="cancel_reservation")
+        elif _is_denial(query):
+            memory["pending_cancel"] = None
+            _log_drift("cancel_reservation", len(query))
+            return ChatResponse(
+                response="No problem! Your reservation is still active.",
+                intent="cancel_reservation",
+            )
+
     with get_openai_callback() as cb:
         t0 = time.perf_counter()
         response = graph.invoke({
@@ -103,6 +154,7 @@ def chat(payload: ChatRequest):
             "reservation_id": None,
             "current_reservation": memory["current_reservation"],
             "chat_history": memory["chat_history"],
+            "pending_cancel": memory.get("pending_cancel"),
         })
         graph_ms = round((time.perf_counter() - t0) * 1000, 2)
 
@@ -121,6 +173,9 @@ def chat(payload: ChatRequest):
 
     _log_drift(response.get("intent", "unknown"), len(query))
 
+    pending_cancel = _extract_pending_cancel(response, memory)
+    if pending_cancel:
+        memory["pending_cancel"] = pending_cancel
     if response.get("reservation_data"):
         memory["current_reservation"] = response["reservation_data"]
 
@@ -148,6 +203,24 @@ async def chat_stream(payload: ChatRequest):
     current_reservation = memory.get("current_reservation") or {}
     if memory.get("user_email") and not current_reservation.get("email"):
         current_reservation = {**current_reservation, "email": memory["user_email"]}
+
+    # Intercept cancellation confirmation before invoking the graph
+    pending = memory.get("pending_cancel")
+    if pending:
+        if _is_confirmation(query):
+            from app.tools.reservation_tools import cancel_reservation_tool
+            result = cancel_reservation_tool(pending["reservation_id"], pending["email"])
+            memory["pending_cancel"] = None
+            _log_drift("cancel_reservation", len(query))
+            async def confirm_stream():
+                yield str(result)
+            return StreamingResponse(confirm_stream(), media_type="text/plain")
+        elif _is_denial(query):
+            memory["pending_cancel"] = None
+            _log_drift("cancel_reservation", len(query))
+            async def deny_stream():
+                yield "No problem! Your reservation is still active."
+            return StreamingResponse(deny_stream(), media_type="text/plain")
 
     # Classify intent (non-streaming — track tokens here)
     intent_prompt = INTENT_PROMPT.format(
@@ -207,6 +280,7 @@ async def chat_stream(payload: ChatRequest):
                 "reservation_id": None,
                 "current_reservation": current_reservation,
                 "chat_history": memory["chat_history"],
+                "pending_cancel": memory.get("pending_cancel"),
             })
 
         logger.info(
@@ -221,8 +295,12 @@ async def chat_stream(payload: ChatRequest):
             },
         )
 
+        pending_cancel = _extract_pending_cancel(response, memory)
+        if pending_cancel:
+            memory["pending_cancel"] = pending_cancel
         if response.get("reservation_id"):
             memory["current_reservation"] = None
+            memory["pending_cancel"] = None
         elif response.get("reservation_data"):
             memory["current_reservation"] = response["reservation_data"]
 
@@ -324,3 +402,39 @@ def metrics_health():
             1 for _ in open(_DRIFT_LOG) if _DRIFT_LOG.exists()
         ) if _DRIFT_LOG.exists() else 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# /escalate  — guest raises a question that the bot could not answer
+# ---------------------------------------------------------------------------
+
+@app.post("/escalate", status_code=201)
+def escalate(payload: EscalationRequest):
+    escalation_id = create_escalation(
+        conversation_id=payload.conversation_id,
+        query=payload.query,
+        guest_email=payload.guest_email,
+    )
+    logger.info(
+        "escalation_created",
+        extra={"escalation_id": escalation_id, "query": payload.query},
+    )
+    return {"escalation_id": escalation_id, "status": "PENDING"}
+
+
+# ---------------------------------------------------------------------------
+# /admin/escalations  — hotel staff view & resolve pending questions
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/escalations")
+def list_escalations():
+    return {"escalations": get_pending_escalations()}
+
+
+@app.patch("/admin/escalations/{escalation_id}/resolve")
+def resolve(escalation_id: int):
+    found = resolve_escalation(escalation_id)
+    if not found:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Escalation not found")
+    return {"escalation_id": escalation_id, "status": "RESOLVED"}
