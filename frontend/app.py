@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import uuid
 import os
+import time
 
 try:
     API_URL = st.secrets["API_URL"]
@@ -105,6 +106,21 @@ st.markdown("""
 
     /* Divider */
     hr { border-color: #cbd5e1; }
+
+    /* Blinking cursor */
+    @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+    .blink-cursor { animation: blink 1s step-start infinite; font-size: 1.2rem; }
+
+    /* Latency pill */
+    .latency-pill {
+        display: inline-block;
+        background: #f1f5f9;
+        color: #64748b;
+        font-size: 0.72rem;
+        padding: 0.1rem 0.5rem;
+        border-radius: 999px;
+        margin-top: 0.25rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -194,7 +210,8 @@ def send(query: str):
 
     with st.chat_message("assistant", avatar="🏨"):
         placeholder = st.empty()
-        placeholder.markdown("*Arranging your experience at Grand Azure Bay...*")
+        placeholder.markdown('<span class="blink-cursor">▋</span> *Thinking...*', unsafe_allow_html=True)
+        t_start = time.time()
         try:
             with requests.post(
                 f"{API_URL}/chat/stream",
@@ -214,6 +231,11 @@ def send(query: str):
                             yield chunk.decode("utf-8")
 
                 reply = st.write_stream(token_generator())
+                elapsed = time.time() - t_start
+                st.markdown(
+                    f'<span class="latency-pill">⚡ {elapsed:.1f}s</span>',
+                    unsafe_allow_html=True,
+                )
                 rid = None
 
         except requests.exceptions.ConnectionError:
