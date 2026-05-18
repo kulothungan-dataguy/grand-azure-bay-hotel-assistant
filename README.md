@@ -66,7 +66,7 @@ Streamlit Frontend  ──POST /chat/stream──►  FastAPI Server
 - **Structured booking form** — date pickers and dropdowns eliminate LLM date-parsing errors
 - **Active-only reservations** — view and cancel show only CONFIRMED + future check-out dates
 - **Human escalation** — "Ask a Human" button appears when the bot can't answer; query stored for staff via `/admin/escalations`
-- **RAG with caching** — diskcache prevents duplicate LLM calls for repeated hotel questions
+- **Smart RAG cache** — diskcache with query normalisation, fallback-response guard (bad answers never cached), and auto-clear on knowledge base update
 - **Safety guardrails** — prompt injection, SQL attempts, and bulk data requests are blocked
 - **Streaming responses** — `/chat/stream` streams tokens for low perceived latency
 - **Observability** — latency middleware, OpenAI token tracking, intent drift log, LLM fallback stats
@@ -117,6 +117,7 @@ Chat UI at `http://localhost:8501` · API docs at `http://localhost:8000/docs`
 | POST | `/escalate` | Guest escalates unanswered question |
 | GET | `/admin/escalations` | Staff view pending escalations |
 | PATCH | `/admin/escalations/{id}/resolve` | Mark escalation resolved |
+| DELETE | `/admin/cache` | Clear entire RAG cache |
 | GET | `/metrics/health` | Cache hit rate, LLM stats |
 | GET | `/metrics/drift` | Intent distribution over time |
 
@@ -160,8 +161,8 @@ The prompt instructs the model to answer only from retrieved context. If unavail
 **Human escalation for knowledge gaps**
 When the bot can't answer, the guest can escalate with one click. The query is stored in SQLite and visible to hotel staff at `/admin/escalations`. This is preferable to dead-end "contact front desk" messages.
 
-**diskcache for RAG responses**
-Module-level diskcache with 24 h TTL. Repeated hotel questions (check-in time, cancellation policy) are served instantly without an LLM call.
+**Smart RAG cache**
+diskcache with 24 h TTL and three quality guards: (1) queries are normalised before hashing so different phrasings of the same question share one cache entry; (2) fallback responses ("I don't have that information") are never cached — a bad answer is not locked in forever; (3) the cache is automatically cleared when `ingest.py` rebuilds the FAISS index so stale answers don't survive a knowledge base update. A `DELETE /admin/cache` endpoint allows manual invalidation.
 
 **OpenAI primary, Groq optional fallback**
 Groq (llama-3.1-8b-instant) is used as a fallback if OpenAI fails. Configurable via `GROQ_API_KEY`. Ollama removed to keep deployment simple.

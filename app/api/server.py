@@ -22,7 +22,7 @@ from app.db.operations import create_escalation, get_pending_escalations, resolv
 from app.utils.logger import logger
 from app.schemas.api_schemas import ChatRequest, ChatResponse, EscalationRequest
 from app.memory.store import conversation_memory
-from app.cache.store import rag_cache as _rag_cache
+from app.cache.store import rag_cache as _rag_cache, make_cache_key, is_cacheable
 from app.llm.provider import fallback_stats
 
 _DRIFT_LOG = Path(".metrics/intent_log.jsonl")
@@ -242,7 +242,7 @@ async def chat_stream(payload: ChatRequest):
     _log_drift(intent, len(query))
 
     if intent == "hotel_qa":
-        cache_key = hashlib.md5(query.lower().strip().encode()).hexdigest()
+        cache_key = make_cache_key(query)
         if cache_key in _rag_cache:
             logger.info("rag_cache_hit", extra={"query": query})
             cached = _rag_cache[cache_key]
@@ -262,13 +262,27 @@ async def chat_stream(payload: ChatRequest):
                 if chunk.content:
                     full_response.append(chunk.content)
                     yield chunk.content
-            _rag_cache.set(
-                cache_key,
-                {"response": "".join(full_response)},
-                expire=86400,
-            )
+            response_text = "".join(full_response)
+            if is_cacheable(response_text):
+                _rag_cache.set(cache_key, {"response": response_text}, expire=86400)
+            else:
+                logger.info("rag_cache_skip_fallback", extra={"query": query})
 
         return StreamingResponse(generate(), media_type="text/plain")
+    
+    elif intent == "general_interactions":
+        chat_history = memory.get("chat_history", [])
+        gen_prompt = (
+            f"You are a friendly hotel concierge assistant for Grand Azure Bay Hotel. "
+            f"Respond naturally to the guest's message.\n\n"
+            f"Chat history: {chat_history}\n"
+            f"Guest: {query}\nAssistant:"
+        )
+        async def gen_stream():
+            async for chunk in llm.astream(gen_prompt):
+                if chunk.content:
+                    yield chunk.content
+        return StreamingResponse(gen_stream(), media_type="text/plain")
 
     else:
         with get_openai_callback() as cb:
@@ -438,3 +452,15 @@ def resolve(escalation_id: int):
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Escalation not found")
     return {"escalation_id": escalation_id, "status": "RESOLVED"}
+
+
+# ---------------------------------------------------------------------------
+# /admin/cache  — cache management
+# ---------------------------------------------------------------------------
+
+@app.delete("/admin/cache")
+def clear_cache():
+    count = len(_rag_cache)
+    _rag_cache.clear()
+    logger.info("cache_cleared", extra={"entries_removed": count})
+    return {"cleared": True, "entries_removed": count}
