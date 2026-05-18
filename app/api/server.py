@@ -1,3 +1,5 @@
+import hashlib
+import diskcache
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 
@@ -12,6 +14,7 @@ from app.utils.logger import logger
 from app.schemas.api_schemas import ChatRequest, ChatResponse
 from app.memory.store import conversation_memory
 
+_rag_cache = diskcache.Cache(".rag_cache")
 
 app = FastAPI()
 
@@ -115,24 +118,35 @@ async def chat_stream(payload: ChatRequest):
     intent = intent_result.intent
 
     if intent == "hotel_qa":
-        # Step 2: retrieve docs
+        # Check cache first
+        cache_key = hashlib.md5(query.lower().strip().encode()).hexdigest()
+        if cache_key in _rag_cache:
+            logger.info(f"Stream RAG cache hit: {query}")
+            cached = _rag_cache[cache_key]
+            async def cached_stream():
+                yield cached["response"]
+            return StreamingResponse(cached_stream(), media_type="text/plain")
+
+        # Retrieve docs and stream
         docs = retriever.invoke(query)
         context = "\n\n".join(doc.page_content for doc in docs)
         rag_prompt = RAG_PROMPT.format(context=context, question=query)
 
-        # Step 3: stream LLM tokens
         async def generate():
+            full_response = []
             async for chunk in llm.astream(rag_prompt):
                 if chunk.content:
+                    full_response.append(chunk.content)
                     yield chunk.content
+            _rag_cache.set(cache_key, {"response": "".join(full_response)}, expire=86400)
 
         return StreamingResponse(generate(), media_type="text/plain")
 
     else:
-        # Reservations and unsafe — run graph normally, return as one chunk
+        # Pass already-classified intent to skip redundant classification in graph
         response = graph.invoke({
             "query": query,
-            "intent": None,
+            "intent": intent,
             "response": None,
             "reservation_data": None,
             "reservation_id": None,
