@@ -1,7 +1,7 @@
 import hashlib
 from app.graph.state import AssistantState
 from app.llm.provider import get_llm
-from app.cache.store import rag_cache as _rag_cache
+from app.cache.store import rag_cache as _rag_cache, make_cache_key, is_cacheable
 from app.rag.retriever import retriever
 from app.rag.prompts import RAG_PROMPT
 from app.rag.intent_prompt import INTENT_PROMPT
@@ -33,7 +33,7 @@ def intent_router_node(state: AssistantState):
 
 def rag_node(state: AssistantState):
     query = state["query"]
-    cache_key = hashlib.md5(query.lower().strip().encode()).hexdigest()
+    cache_key = make_cache_key(query)
 
     if cache_key in _rag_cache:
         logger.info(f"RAG cache hit for: {query}")
@@ -46,7 +46,10 @@ def rag_node(state: AssistantState):
 
     response = llm.invoke(prompt)
 
-    _rag_cache.set(cache_key, {"context": context, "response": response.content}, expire=86400)
+    if is_cacheable(response.content):
+        _rag_cache.set(cache_key, {"response": response.content}, expire=86400)
+    else:
+        logger.info(f"RAG cache skip (fallback response) for: {query}")
 
     return {"response": response.content}
 
@@ -151,11 +154,19 @@ def tool_node(state: AssistantState):
             if not confirmed:
                 return {"response": "You have no upcoming reservations to cancel."}
             if len(confirmed) == 1:
-                response = cancel_reservation_tool(
-                    reservation_id=confirmed[0]["reservation_id"],
-                    requester_email=email
-                )
-                return {"response": str(response)}
+                r = confirmed[0]
+                return {
+                    "response": (
+                        f"Here are the details for your reservation:\n\n"
+                        f"**Reservation #{r['reservation_id']}**\n"
+                        f"- Room: {r['room_type']}\n"
+                        f"- Check-in: {r['check_in_date']}\n"
+                        f"- Check-out: {r['check_out_date']}\n"
+                        f"- Status: ✅ {r['status']}\n\n"
+                        f"Are you sure you want to cancel this reservation? Reply **Yes** to confirm or **No** to keep it."
+                    ),
+                    "pending_cancel": {"reservation_id": r["reservation_id"], "email": email},
+                }
             lines = []
             for r in confirmed:
                 lines.append(
@@ -170,13 +181,28 @@ def tool_node(state: AssistantState):
                     "Here are your reservations:\n\n" + "\n\n".join(lines) +
                     "\n\nWhich reservation would you like to cancel? Please share the Reservation ID."
                 ),
-                "reservation_list": confirmed
+                "reservation_list": confirmed,
             }
 
-        response = cancel_reservation_tool(
-            reservation_id=lookup.reservation_id,
-            requester_email=email
-        )
+        from app.db.operations import get_reservation
+        reservation = get_reservation(lookup.reservation_id)
+        if not reservation:
+            return {"response": "Reservation not found."}
+        if reservation["email"].lower() != email.lower():
+            return {"response": "Access denied. This reservation does not belong to your email."}
+
+        return {
+            "response": (
+                f"Here are the details for your reservation:\n\n"
+                f"**Reservation #{reservation['reservation_id']}**\n"
+                f"- Room: {reservation['room_type']}\n"
+                f"- Check-in: {reservation['check_in_date']}\n"
+                f"- Check-out: {reservation['check_out_date']}\n"
+                f"- Status: ✅ {reservation['status']}\n\n"
+                f"Are you sure you want to cancel this reservation? Reply **Yes** to confirm or **No** to keep it."
+            ),
+            "pending_cancel": {"reservation_id": reservation["reservation_id"], "email": email},
+        }
 
     else:
 

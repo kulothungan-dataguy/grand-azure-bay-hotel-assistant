@@ -36,3 +36,8 @@ vectorstore = FAISS.from_documents(
 vectorstore.save_local("faiss_index")
 
 print("FAISS index created successfully")
+
+# Clear RAG cache so stale answers don't persist after knowledge base update
+from app.cache.store import rag_cache
+rag_cache.clear()
+print("RAG cache cleared")
