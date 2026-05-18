@@ -9,3 +9,4 @@ class AssistantState(TypedDict):
     current_reservation: Optional[dict]
     reservation_id: Optional[int]
     reservation_list: Optional[list]
+    pending_cancel: Optional[dict]  # {"reservation_id": int, "email": str}

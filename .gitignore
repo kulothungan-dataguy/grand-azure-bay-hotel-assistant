@@ -30,8 +30,12 @@ faiss_index/
 htmlcov/
 locust_results*.csv
 
-# Cache
+# Cache / runtime metrics
 .rag_cache/
+.metrics/
+
+# Claude Code editor settings
+.claude/
 
 # IDE
 .vscode/
