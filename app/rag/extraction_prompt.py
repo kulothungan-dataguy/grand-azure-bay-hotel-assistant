@@ -1,17 +1,6 @@
 EXTRACTION_PROMPT = """
-You are extracting hotel reservation data.
+Extract reservation details from the conversation. Return null for any field the user has not explicitly stated. Do not guess or invent values.
 
-Previous Conversation:
-{chat_history}
-
-Extract:
-
-- guest_name
-- email
-- room_type
-- check_in_date
-- check_out_date
-
-Current User Query:
-{query}
+Chat history: {chat_history}
+User: {query}
 """

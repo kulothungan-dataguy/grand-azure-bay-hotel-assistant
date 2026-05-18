@@ -28,6 +28,10 @@ faiss_index/
 .pytest_cache/
 .coverage
 htmlcov/
+locust_results*.csv
+
+# Cache
+.rag_cache/
 
 # IDE
 .vscode/

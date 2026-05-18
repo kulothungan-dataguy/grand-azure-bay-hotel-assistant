@@ -1,10 +1,7 @@
 import hashlib
-import diskcache
 from app.graph.state import AssistantState
 from app.llm.provider import get_llm
-
-_rag_cache = diskcache.Cache(".rag_cache")
-from app.llm.config import OLLAMA_MODEL
+from app.cache.store import rag_cache as _rag_cache
 from app.rag.retriever import retriever
 from app.rag.prompts import RAG_PROMPT
 from app.rag.intent_prompt import INTENT_PROMPT
@@ -23,13 +20,14 @@ llm = get_llm()
 
 
 def intent_router_node(state: AssistantState):
+    if state.get("intent"):
+        return {}
+
     query = state["query"]
     chat_history = state.get("chat_history", [])
-
     prompt = INTENT_PROMPT.format(chat_history=chat_history, query=query)
     structured_llm = llm.with_structured_output(IntentOutput)
     result = structured_llm.invoke(prompt)
-
     return {"intent": result.intent}
 
 
@@ -40,34 +38,26 @@ def rag_node(state: AssistantState):
     if cache_key in _rag_cache:
         logger.info(f"RAG cache hit for: {query}")
         cached = _rag_cache[cache_key]
-        return {"retrieved_context": cached["context"], "response": cached["response"]}
+        return {"response": cached["response"]}
 
     docs = retriever.invoke(query)
     context = "\n\n".join(doc.page_content for doc in docs)
     prompt = RAG_PROMPT.format(context=context, question=query)
 
-    try:
-        response = llm.invoke(prompt)
-    except Exception as e:
-        logger.error(f"Primary LLM failed: {e}")
-        from langchain_ollama import ChatOllama
-        fallback_llm = ChatOllama(model=OLLAMA_MODEL)
-        response = fallback_llm.invoke(prompt)
+    response = llm.invoke(prompt)
 
     _rag_cache.set(cache_key, {"context": context, "response": response.content}, expire=86400)
 
-    return {
-        "retrieved_context": context,
-        "response": response.content
-    }
+    return {"response": response.content}
 
 
 def _extract_lookup_info(query: str, chat_history: list) -> ReservationIDOutput:
     prompt = (
-        f"Extract the reservation ID and email address from the user's message.\n\n"
-        f"Chat history: {chat_history}\n"
-        f"User query: {query}\n\n"
-        "Return the integer reservation ID if mentioned, the email if mentioned, or null for either if not found."
+        f"Extract the reservation ID and email address from the user's CURRENT message only. "
+        f"Ignore previous conversation history — only look at the current message.\n\n"
+        f"Current user message: {query}\n\n"
+        "Return the integer reservation ID only if the user explicitly states one in this message, "
+        "the email if mentioned, or null for either if not found in this message."
     )
     structured_llm = llm.with_structured_output(ReservationIDOutput)
     return structured_llm.invoke(prompt)
@@ -126,8 +116,8 @@ def tool_node(state: AssistantState):
             state.get("current_reservation") or {}
         ).get("email")
 
-        if not email and lookup.reservation_id is None:
-            return {"response": "Please share your email address or reservation ID so I can look up your reservation."}
+        if not email:
+            return {"response": "Please share your email address so I can look up your reservations."}
 
         result = view_reservation_tool(
             reservation_id=lookup.reservation_id,
@@ -150,8 +140,38 @@ def tool_node(state: AssistantState):
             state.get("current_reservation") or {}
         ).get("email")
 
-        if not email and lookup.reservation_id is None:
-            return {"response": "Please share your email address or reservation ID so I can cancel your reservation."}
+        if not email:
+            return {"response": "Please share your email address so I can look up your reservations for cancellation."}
+
+        if lookup.reservation_id is None and email:
+            from app.db.operations import get_reservations_by_email
+            from app.tools.reservation_tools import _is_active
+            reservations = get_reservations_by_email(email)
+            confirmed = [r for r in reservations if _is_active(r)]
+            if not confirmed:
+                return {"response": "You have no upcoming reservations to cancel."}
+            if len(confirmed) == 1:
+                response = cancel_reservation_tool(
+                    reservation_id=confirmed[0]["reservation_id"],
+                    requester_email=email
+                )
+                return {"response": str(response)}
+            lines = []
+            for r in confirmed:
+                lines.append(
+                    f"**Reservation #{r['reservation_id']}**\n"
+                    f"- Room: {r['room_type']}\n"
+                    f"- Check-in: {r['check_in_date']}\n"
+                    f"- Check-out: {r['check_out_date']}\n"
+                    f"- Status: ✅ {r['status']}"
+                )
+            return {
+                "response": (
+                    "Here are your reservations:\n\n" + "\n\n".join(lines) +
+                    "\n\nWhich reservation would you like to cancel? Please share the Reservation ID."
+                ),
+                "reservation_list": confirmed
+            }
 
         response = cancel_reservation_tool(
             reservation_id=lookup.reservation_id,

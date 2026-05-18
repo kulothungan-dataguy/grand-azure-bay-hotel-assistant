@@ -1,8 +1,10 @@
+import re
 import streamlit as st
 import requests
 import uuid
 import os
 import time
+from datetime import date, timedelta
 
 try:
     API_URL = st.secrets["API_URL"]
@@ -104,6 +106,15 @@ st.markdown("""
         margin-top: 0.25rem;
     }
 
+    /* Booking form card */
+    .booking-form-card {
+        background: white;
+        border: 1.5px solid #cbd5e1;
+        border-radius: 12px;
+        padding: 1.2rem 1.5rem;
+        margin-top: 0.5rem;
+    }
+
     /* Divider */
     hr { border-color: #cbd5e1; }
 
@@ -132,8 +143,12 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "pending_query" not in st.session_state:
     st.session_state.pending_query = None
-if "reservation_list" not in st.session_state:
-    st.session_state.reservation_list = []
+if "show_booking_form" not in st.session_state:
+    st.session_state.show_booking_form = False
+if "cancel_res_ids" not in st.session_state:
+    st.session_state.cancel_res_ids = []
+if "user_email" not in st.session_state:
+    st.session_state.user_email = None
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -171,6 +186,9 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.conversation_id = str(uuid.uuid4())
         st.session_state.pending_query = None
+        st.session_state.show_booking_form = False
+        st.session_state.cancel_res_ids = []
+        st.session_state.user_email = None
         st.rerun()
 
     st.markdown(
@@ -191,6 +209,33 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# ── Welcome / email capture ───────────────────────────────────────────────────
+if not st.session_state.user_email:
+    with st.chat_message("assistant", avatar="🏨"):
+        st.markdown(
+            "Welcome to **Grand Azure Bay Hotel**! 🏨\n\n"
+            "To help you with reservations, could you please share your **email address**? "
+            "You can also ask me anything about the hotel without it."
+        )
+    with st.form("email_form", clear_on_submit=True):
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            email_input = st.text_input("Your email address", placeholder="you@example.com", label_visibility="collapsed")
+        with col2:
+            email_submitted = st.form_submit_button("Continue", type="primary")
+    if email_submitted:
+        if "@" in email_input and "." in email_input:
+            st.session_state.user_email = email_input.strip()
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": "Welcome! How can I assist you today? You can ask about the hotel, book a room, or manage your reservations.",
+            })
+            st.rerun()
+        else:
+            st.error("Please enter a valid email address.")
+    st.stop()
+
+
 # ── Chat history ──────────────────────────────────────────────────────────────
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"], avatar="🧑" if msg["role"] == "user" else "🏨"):
@@ -200,6 +245,17 @@ for msg in st.session_state.messages:
                 f'<span class="res-pill">Reservation ID: {msg["reservation_id"]}</span>',
                 unsafe_allow_html=True,
             )
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+_BOOKING_TRIGGERS = ["full name", "check-in date", "check-out date", "email address"]
+
+def _is_booking_ask(text: str) -> bool:
+    lower = text.lower()
+    return sum(1 for p in _BOOKING_TRIGGERS if p in lower) >= 2
+
+def _is_cancel_query(text: str) -> bool:
+    return "cancel" in text.lower()
 
 
 # ── Send message ──────────────────────────────────────────────────────────────
@@ -212,12 +268,15 @@ def send(query: str):
         placeholder = st.empty()
         placeholder.markdown('<span class="blink-cursor">▋</span> *Thinking...*', unsafe_allow_html=True)
         t_start = time.time()
+        reply = ""
+        rid = None
         try:
             with requests.post(
                 f"{API_URL}/chat/stream",
                 json={
                     "conversation_id": st.session_state.conversation_id,
                     "query": query,
+                    "user_email": st.session_state.user_email,
                 },
                 stream=True,
                 timeout=60,
@@ -236,13 +295,13 @@ def send(query: str):
                     f'<span class="latency-pill">⚡ {elapsed:.1f}s</span>',
                     unsafe_allow_html=True,
                 )
-                rid = None
+                _rid_match = re.search(r"Reservation ID[:\s#]+(\d+)", reply or "")
+                rid = int(_rid_match.group(1)) if _rid_match else None
 
         except requests.exceptions.ConnectionError:
             placeholder.empty()
             reply = "Cannot reach the hotel server. Please ensure the API is running."
             st.markdown(reply)
-            rid = None
 
         if rid:
             st.markdown(
@@ -250,40 +309,72 @@ def send(query: str):
                 unsafe_allow_html=True,
             )
 
-        # Contextual room type buttons
-        if reply and "room type" in reply.lower():
-            st.markdown("**Select a room type:**")
-            cols = st.columns(3)
-            for i, room in enumerate(["Standard", "Deluxe", "Suite"]):
-                if cols[i].button(room, key=f"room_{room}_{len(st.session_state.messages)}"):
-                    st.session_state.pending_query = room
-
-        # Reservation list — parse IDs from response and show Cancel buttons
-        if reply and "here are your reservations" in reply.lower():
-            import re
-            res_ids = re.findall(r"#(\d+)", reply)
-            if res_ids:
-                st.markdown("**Actions:**")
-                for res_id in res_ids:
-                    if st.button(
-                        f"Cancel Reservation #{res_id}",
-                        key=f"cancel_{res_id}_{len(st.session_state.messages)}"
-                    ):
-                        st.session_state.pending_query = f"Cancel reservation {res_id}"
-
     st.session_state.messages.append({
         "role": "assistant",
         "content": reply,
         "reservation_id": rid,
     })
 
+    # Show booking form when bot asks for reservation details
+    st.session_state.show_booking_form = _is_booking_ask(reply)
 
-# Handle sidebar quick-question clicks
+    # Show cancel buttons only when user explicitly asked to cancel
+    if _is_cancel_query(query) and "reservation" in reply.lower():
+        st.session_state.cancel_res_ids = re.findall(r"#(\d+)", reply)
+    else:
+        st.session_state.cancel_res_ids = []
+
+
+# ── Handle pending queries (sidebar clicks) ───────────────────────────────────
 if st.session_state.pending_query:
     q = st.session_state.pending_query
     st.session_state.pending_query = None
     send(q)
 
-# Handle typed input
+# ── Handle typed input ────────────────────────────────────────────────────────
 if user_input := st.chat_input("Ask about the hotel or manage your reservation…"):
     send(user_input)
+
+
+# ── Booking form (persists across reruns) ─────────────────────────────────────
+if st.session_state.show_booking_form:
+    st.markdown("---")
+    st.markdown("### Complete Your Booking")
+    with st.form("booking_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            name = st.text_input("Full Name *")
+            room_type = st.selectbox("Room Type", ["Standard", "Deluxe", "Suite"])
+        with col2:
+            today = date.today()
+            check_in = st.date_input("Check-in Date", value=today + timedelta(days=1), min_value=today)
+            check_out = st.date_input("Check-out Date", value=today + timedelta(days=2), min_value=today)
+        submitted = st.form_submit_button("Confirm Booking", type="primary")
+
+    if submitted:
+        errors = []
+        if not name.strip():
+            errors.append("Full name is required.")
+        if check_out <= check_in:
+            errors.append("Check-out date must be after check-in date.")
+        if errors:
+            for err in errors:
+                st.error(err)
+        else:
+            st.session_state.show_booking_form = False
+            st.session_state.pending_query = (
+                f"Book a room for {name.strip()}, email {st.session_state.user_email}, "
+                f"room type {room_type}, check-in {check_in}, check-out {check_out}"
+            )
+            st.rerun()
+
+
+# ── Cancel buttons (only on explicit cancel intent) ───────────────────────────
+if st.session_state.cancel_res_ids:
+    st.markdown("---")
+    st.markdown("**Select reservation to cancel:**")
+    for res_id in st.session_state.cancel_res_ids:
+        if st.button(f"Cancel Reservation #{res_id}", key=f"cancel_bottom_{res_id}"):
+            st.session_state.cancel_res_ids = []
+            st.session_state.pending_query = f"Cancel reservation {res_id}"
+            st.rerun()
