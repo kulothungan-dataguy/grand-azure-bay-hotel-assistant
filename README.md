@@ -60,6 +60,7 @@ Streamlit Frontend  ──POST /chat/stream──►  FastAPI Server
 
 ## Key Features
 
+- **Multi-turn context (sliding window)** — both sides of every conversation stored; trimmed to last 6 messages (3 exchanges) so the bot can reference its own previous answers without unbounded token growth
 - **Email-first flow** — email collected once at session start, auto-injected into all reservation operations
 - **Structured booking form** — date pickers and dropdowns eliminate LLM date-parsing errors
 - **Active-only reservations** — view and cancel show only CONFIRMED + future check-out dates
@@ -178,9 +179,6 @@ Groq (llama-3.1-8b-instant) is used as a fallback if OpenAI fails. Configurable 
 ---
 
 ## Potential Improvements
-
-**Full multi-turn context with sliding window**
-Currently only user messages are stored in chat history — the assistant's responses are not. Storing both sides and trimming to the last 6 messages (3 exchanges) would let the bot reference its own previous answers ("as I mentioned, check-in is at 2 PM"), avoid repeating questions it already asked, and handle follow-ups like "tell me more about that" correctly. Trimming to 6 messages keeps prompt tokens bounded so latency and cost don't grow unboundedly over long sessions.
 
 **Pre-populate booking form from previous reservation**
 Since the last completed booking is already in session state, the booking form could pre-fill the guest name and room type from the previous reservation. The guest only needs to change what's different (e.g. new dates). This is particularly useful for repeat guests who book the same room type regularly.

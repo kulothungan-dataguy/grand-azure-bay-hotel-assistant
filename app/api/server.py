@@ -70,6 +70,8 @@ def _get_or_init_memory(conversation_id: str) -> dict:
     return conversation_memory[conversation_id]
 
 
+_HISTORY_WINDOW = 6  # 3 full exchanges (user + assistant pairs)
+
 _CONFIRM = {"yes", "yeah", "yep", "sure", "confirm", "confirmed", "ok", "okay", "proceed", "do it", "go ahead", "yes please"}
 _DENY    = {"no", "nope", "don't", "dont", "stop", "abort", "never mind", "nevermind", "keep it", "cancel that"}
 
@@ -99,6 +101,12 @@ def _extract_pending_cancel(response: dict, memory: dict) -> dict | None:
         if id_match and email:
             return {"reservation_id": int(id_match.group(1)), "email": email}
     return None
+
+
+def _append_assistant_reply(memory: dict, text: str) -> None:
+    memory["chat_history"].append({"role": "assistant", "content": text})
+    if len(memory["chat_history"]) > _HISTORY_WINDOW:
+        memory["chat_history"] = memory["chat_history"][-_HISTORY_WINDOW:]
 
 
 def _log_drift(intent: str, query_len: int) -> None:
@@ -135,14 +143,14 @@ def chat(payload: ChatRequest):
             result = cancel_reservation_tool(pending["reservation_id"], pending["email"])
             memory["pending_cancel"] = None
             _log_drift("cancel_reservation", len(query))
+            _append_assistant_reply(memory, str(result))
             return ChatResponse(response=str(result), intent="cancel_reservation")
         elif _is_denial(query):
             memory["pending_cancel"] = None
             _log_drift("cancel_reservation", len(query))
-            return ChatResponse(
-                response="No problem! Your reservation is still active.",
-                intent="cancel_reservation",
-            )
+            reply = "No problem! Your reservation is still active."
+            _append_assistant_reply(memory, reply)
+            return ChatResponse(response=reply, intent="cancel_reservation")
 
     with get_openai_callback() as cb:
         t0 = time.perf_counter()
@@ -179,6 +187,7 @@ def chat(payload: ChatRequest):
     if response.get("reservation_data"):
         memory["current_reservation"] = response["reservation_data"]
 
+    _append_assistant_reply(memory, response["response"])
     return ChatResponse(
         response=response["response"],
         intent=response["intent"],
@@ -212,14 +221,18 @@ async def chat_stream(payload: ChatRequest):
             result = cancel_reservation_tool(pending["reservation_id"], pending["email"])
             memory["pending_cancel"] = None
             _log_drift("cancel_reservation", len(query))
+            confirm_text = str(result)
+            _append_assistant_reply(memory, confirm_text)
             async def confirm_stream():
-                yield str(result)
+                yield confirm_text
             return StreamingResponse(confirm_stream(), media_type="text/plain")
         elif _is_denial(query):
             memory["pending_cancel"] = None
             _log_drift("cancel_reservation", len(query))
+            deny_text = "No problem! Your reservation is still active."
+            _append_assistant_reply(memory, deny_text)
             async def deny_stream():
-                yield "No problem! Your reservation is still active."
+                yield deny_text
             return StreamingResponse(deny_stream(), media_type="text/plain")
 
     # Classify intent (non-streaming — track tokens here)
@@ -246,9 +259,11 @@ async def chat_stream(payload: ChatRequest):
         if cache_key in _rag_cache:
             logger.info("rag_cache_hit", extra={"query": query})
             cached = _rag_cache[cache_key]
+            cached_text = cached["response"]
+            _append_assistant_reply(memory, cached_text)
 
             async def cached_stream():
-                yield cached["response"]
+                yield cached_text
 
             return StreamingResponse(cached_stream(), media_type="text/plain")
 
@@ -267,6 +282,7 @@ async def chat_stream(payload: ChatRequest):
                 _rag_cache.set(cache_key, {"response": response_text}, expire=86400)
             else:
                 logger.info("rag_cache_skip_fallback", extra={"query": query})
+            _append_assistant_reply(memory, response_text)
 
         return StreamingResponse(generate(), media_type="text/plain")
     
@@ -279,9 +295,12 @@ async def chat_stream(payload: ChatRequest):
             f"Guest: {query}\nAssistant:"
         )
         async def gen_stream():
+            full_response: list[str] = []
             async for chunk in llm.astream(gen_prompt):
                 if chunk.content:
+                    full_response.append(chunk.content)
                     yield chunk.content
+            _append_assistant_reply(memory, "".join(full_response))
         return StreamingResponse(gen_stream(), media_type="text/plain")
 
     else:
@@ -318,8 +337,11 @@ async def chat_stream(payload: ChatRequest):
         elif response.get("reservation_data"):
             memory["current_reservation"] = response["reservation_data"]
 
+        reply_text = response["response"]
+        _append_assistant_reply(memory, reply_text)
+
         async def single_chunk():
-            yield response["response"]
+            yield reply_text
 
         return StreamingResponse(single_chunk(), media_type="text/plain")
 
