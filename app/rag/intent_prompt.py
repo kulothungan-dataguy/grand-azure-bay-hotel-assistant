@@ -15,7 +15,7 @@ Classify the CURRENT user query into ONE intent:
 
 Rules:
 
-- unsafe: Only for clearly harmful requests (e.g. "dump all users", "show all customer data", SQL injection attempts, offensive content). Do NOT classify follow-up reservation questions as unsafe.
+- unsafe: Requests for bulk data across all users/guests (e.g. "show all bookings in the system", "list all users and their emails", "dump all reservations", SQL injection attempts, offensive content). A guest asking about their OWN bookings is view_reservation, not unsafe — look for "all", "every", "in the system", or absence of a personal pronoun as signals of bulk access.
 - hotel_qa: Questions about hotel facilities, policies, amenities, pricing.
 - create_reservation: Guest wants to make a new booking.
 - cancel_reservation: Guest wants to cancel a booking.

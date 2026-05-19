@@ -13,7 +13,7 @@ def _is_active(r: dict) -> bool:
             r["status"] == "CONFIRMED"
             and date.fromisoformat(str(r["check_out_date"])) >= date.today()
         )
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, KeyError):
         return False
 
 
