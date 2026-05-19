@@ -132,11 +132,12 @@ pytest tests/test_intent_accuracy.py -v -s
 
 | Suite | Result |
 |---|---|
-| API end-to-end (9 tests) | All passing |
+| API end-to-end (20 tests) | All passing |
+| Unit tests — cache, filters, history (18 tests) | All passing |
 | RAG Faithfulness | 1.00 |
 | RAG Context Recall | 1.00 |
 | RAG Answer Relevancy | 0.86 |
-| Intent accuracy (15 queries) | 100% |
+| Intent accuracy (17 queries) | 100% |
 
 ---
 

@@ -284,12 +284,18 @@ The simplest possible session store — a Python dict. Keys are `conversation_id
 
 ```python
 {
-    "chat_history": [{"role": "user", "content": "..."}],
+    "chat_history": [
+        {"role": "user",      "content": "What time is check-in?"},
+        {"role": "assistant", "content": "Check-in is at 2:00 PM."},
+        # ... trimmed to last 6 messages (_HISTORY_WINDOW = 6)
+    ],
     "current_reservation": None,   # partial booking data during multi-turn
     "user_email": "guest@example.com",
     "pending_cancel": None,        # set when awaiting cancel confirmation
 }
 ```
+
+Both the user's message and the assistant's reply are stored in `chat_history` after every turn. The helper `_append_assistant_reply(memory, text)` appends the assistant message and then trims the list to the last 6 entries (3 full exchanges) so prompt tokens stay bounded regardless of how long the conversation runs. This is called from every exit path in both `/chat` and `/chat/stream`.
 
 This is in-memory, so it resets on server restart. For production, this would be Redis.
 
@@ -316,7 +322,7 @@ async def chat_stream(payload: ChatRequest):
     memory["chat_history"].append({"role": "user", "content": query})
 ```
 
-**Step 1:** Store the user's message in memory. This grows the chat history so the intent classifier has conversation context.
+**Step 1:** Store the user's message in memory. After the response is generated, `_append_assistant_reply()` appends the assistant's reply and trims the list to `_HISTORY_WINDOW = 6` messages (3 full exchanges). Both sides of the conversation are stored so the intent classifier and extraction prompt have full context — the bot can reference its own previous answers.
 
 ```python
     if payload.user_email and not memory.get("user_email"):
