@@ -46,6 +46,14 @@ except EmailNotValidError:
 **Files:** `app/api/server.py:300`, `app/graph/nodes.py:59`  
 Guest email is injected raw into the LLM system prompt. Any phone number or personal detail typed in chat goes to OpenAI/Groq unmodified. Use `presidio-analyzer` or a regex scrubber to replace PII with tokens before sending to the LLM.
 
+### SEC-06 · FAISS index loaded with `allow_dangerous_deserialization=True`
+**Files:** `app/rag/retriever.py:18`  
+The flag disables pickle validation, allowing arbitrary code execution if the `faiss_index/` directory is replaced with a malicious file (e.g. via a compromised volume mount or CI artifact). The risk is low in the current setup because the index is self-generated at build time from a trusted PDF, but the flag should be documented or guarded with a checksum verification of the index file.
+
+### SEC-07 · Dockerfile container runs as root
+**Files:** `Dockerfile`  
+No `USER` directive — the container runs as root. A container escape gives an attacker root access to the host, and violates Kubernetes Pod Security Standards. Add after pip install: `RUN useradd -m appuser && chown -R appuser /app && USER appuser`.
+
 ---
 
 ## 🟠 High — Fix Before Scale
@@ -84,6 +92,26 @@ async for event in graph.astream_events(state, version="v2"):
 ~~**Files:** `app/db/models.py`~~  
 ~~Tables are created with `CREATE TABLE IF NOT EXISTS`. Any schema change (adding a column, index, constraint) has no versioning. Add Alembic for migration tracking before the schema needs to evolve.~~
 
+### INFRA-01 · No HEALTHCHECK in Dockerfile
+**Files:** `Dockerfile`  
+Container orchestrators (Docker Swarm, K8s, HF Spaces) cannot detect a degraded service — zombie containers keep receiving traffic. Add: `HEALTHCHECK --interval=30s --timeout=5s CMD curl -f http://localhost:7860/metrics/health || exit 1`
+
+### INFRA-02 · CI/CD deploys to production without running tests
+**Files:** `.github/workflows/sync-hf-spaces.yml`  
+The workflow merges `master` → HF Spaces on every push with no test step. Broken code ships automatically. Add a job before `sync-backend`/`sync-frontend` that runs `pytest tests/test_unit.py -q` and blocks the sync on failure.
+
+### DB-01 · Missing indexes on frequently-queried columns
+**Files:** `migrations/versions/e84fb6801694_initial_schema.py`  
+`get_reservations_by_email()` causes a full table scan on every lookup; the escalation status filter has the same problem. Add a new Alembic migration with:
+```sql
+CREATE INDEX ix_reservations_email ON reservations (email);
+CREATE INDEX ix_escalations_status  ON escalations  (status);
+```
+
+### BUG-07 · Streaming LLM errors silently truncate the response
+**Files:** `app/api/server.py` — `generate()` (hotel_qa ~line 296) and `gen_stream()` (general ~line 316)  
+If `llm.astream()` raises mid-stream (timeout, rate-limit, network drop), FastAPI closes the connection with no error token. The frontend shows a partial response as if it were complete. Wrap the `async for chunk in llm.astream(...)` loop in try/except; on exception yield a user-visible error sentinel and log the failure.
+
 ---
 
 ## 🟡 Medium — Code Quality & Correctness
@@ -119,6 +147,18 @@ The sliding window keeps only the last 6 messages. A guest who asked about their
 ### ~~PERF-02 · No circuit breaker for OpenAI failures~~
 **Files:** `app/llm/provider.py`  
 When OpenAI is down every request waits for the full HTTP timeout before falling back to Groq. A simple circuit breaker (fail-fast after N consecutive errors within a time window) would reduce latency for all users during an outage.
+
+### BUG-08 · `ChatRequest.query` has no length constraints
+**Files:** `app/schemas/api_schemas.py:8`  
+`query: str` accepts empty strings and arbitrarily large payloads. An empty query wastes an LLM call; a 100 KB payload causes a timeout and inflates costs. Add: `query: str = Field(..., min_length=1, max_length=4000)`.
+
+### BUG-09 · `IntentOutput.intent` accepts any string the LLM returns
+**Files:** `app/schemas/intent_schema.py:7`  
+`intent: str` with no validation. If the LLM hallucinates an intent name (e.g. `"make_booking"`), the routing logic falls through silently to the default branch. Use `Literal["hotel_qa", "create_reservation", "cancel_reservation", "view_reservation", "general_interactions", "unsafe"]` — Pydantic will raise `ValidationError` on any unrecognised value, which can be caught and defaulted to `"general_interactions"`.
+
+### CLEAN-12 · `user_email` stored in session without normalisation
+**Files:** `app/api/server.py:231`  
+`memory["user_email"] = payload.user_email` stores the raw casing. Downstream comparisons use `.lower()`, creating an inconsistency if the key is ever compared directly. Normalise on write: `memory["user_email"] = payload.user_email.strip().lower() if payload.user_email else None`.
 
 ---
 
@@ -164,6 +204,10 @@ SQLite serialises writes. Under concurrent reservation creation from multiple us
 ~~**Files:** `.env.example`~~  
 ~~Comments say "Primary LLM — Groq" but `provider.py` tries OpenAI first. Update the example file to reflect the actual priority order.~~
 
+### CLEAN-13 · No `pyproject.toml` for test and tool configuration
+**Files:** root directory  
+Pytest discovers tests implicitly with no markers (`@pytest.mark.slow`, `@pytest.mark.integration`), no coverage settings, and no ruff/black config. CI invocations are magic strings. Add `pyproject.toml` with `[tool.pytest.ini_options]` (testpaths, markers, slow-test exclusion) and `[tool.coverage.run]`.
+
 ---
 
 ## 💡 Features Not Yet Implemented
@@ -194,6 +238,10 @@ When the bot lists reservations to cancel, show a select dropdown or button grou
 On successful booking or cancellation, re-enable the chat input automatically so the guest can continue the conversation without a page reload.
 
 The building blocks (`show_booking_form`, `cancel_res_ids`) are already in the frontend — this is primarily a state management and UX wiring task, not a new feature from scratch.
+
+### FEAT-06 · Escalation system has no staff notification or SLA tracking
+**Files:** `app/api/server.py` (`/escalate`), `app/db/operations.py`  
+Escalations are created and stored, but hotel staff has no alert (no email, no webhook). There is no SLA timer, `assigned_to` field, or escalation age tracking. An escalation can sit unread indefinitely. On `create_escalation`, fire a configurable webhook (`ESCALATION_WEBHOOK_URL` env var). Add `sla_due_at` and `assigned_to` columns via a follow-up Alembic migration.
 
 ---
 
