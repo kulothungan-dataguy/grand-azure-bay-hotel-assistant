@@ -234,7 +234,12 @@ def reject_node(state: AssistantState):
 
 def extract_reservation_node(state: AssistantState):
     query = state["query"]
-    chat_history = state.get("chat_history", [])
+    existing_reservation = state.get("current_reservation")
+
+    # Only pass chat history when mid-booking (accumulating fields across turns).
+    # For a fresh booking request, restrict extraction to the current message only
+    # so stale values from previous completed bookings in history are not re-used.
+    chat_history = state.get("chat_history", []) if existing_reservation else []
 
     prompt = EXTRACTION_PROMPT.format(
         chat_history=chat_history,
@@ -244,7 +249,6 @@ def extract_reservation_node(state: AssistantState):
     structured_llm = llm.with_structured_output(ReservationData)
     extracted_data = structured_llm.invoke(prompt)
 
-    existing_reservation = state.get("current_reservation")
     new_data = extracted_data.model_dump()
 
     if existing_reservation:
