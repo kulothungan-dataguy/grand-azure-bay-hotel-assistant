@@ -68,26 +68,17 @@ async for event in graph.astream_events(state, version="v2"):
         yield event["data"]["chunk"].content
 ```
 
-### ARCH-04 · Fragile cancellation confirmation via response text parsing
-**Files:** `app/api/server.py:94–110`  
-`_extract_pending_cancel` parses LLM-generated prose to detect a reservation ID for cancellation confirmation. If the bot rephrases the message the regex silently fails. Return a structured `pending_action` field in the API response instead of parsing free text.
+### ~~ARCH-04 · Fragile cancellation confirmation via response text parsing~~
+~~**Files:** `app/api/server.py:94–110`~~  
+~~`_extract_pending_cancel` parses LLM-generated prose to detect a reservation ID for cancellation confirmation. If the bot rephrases the message the regex silently fails. Return a structured `pending_action` field in the API response instead of parsing free text.~~
 
-### ARCH-05 · `with_structured_output` bypasses fallback LLM
-**Files:** `app/llm/provider.py:50`  
-```python
-def with_structured_output(self, schema):
-    return self.primary_llm.with_structured_output(schema)  # no fallback
-```
-Intent classification and extraction calls go directly to OpenAI with no Groq fallback. If OpenAI is down, structured calls fail even though `invoke` and `astream` have fallback logic.
+### ~~ARCH-05 · `with_structured_output` bypasses fallback LLM~~
+~~**Files:** `app/llm/provider.py:50`~~  
+~~Intent classification and extraction calls go directly to OpenAI with no Groq fallback. If OpenAI is down, structured calls fail even though `invoke` and `astream` have fallback logic.~~
 
-### ARCH-06 · Sync fallback inside async stream breaks streaming for users
-**Files:** `app/llm/provider.py:64`  
-When OpenAI's `astream` fails and falls back to Groq, the entire response is returned as a single chunk instead of being streamed:
-```python
-result = self.fallback_llm.invoke(prompt)  # sync, returns full text
-yield result                                # one chunk, not streamed
-```
-Use `self.fallback_llm.astream(prompt)` instead.
+### ~~ARCH-06 · Sync fallback inside async stream breaks streaming for users~~
+~~**Files:** `app/llm/provider.py:64`~~  
+~~When OpenAI's `astream` fails and falls back to Groq, the entire response is returned as a single chunk instead of being streamed. Use `self.fallback_llm.astream(prompt)` instead.~~
 
 ### ~~ARCH-07 · No DB schema migration framework~~
 ~~**Files:** `app/db/models.py`~~  
@@ -177,8 +168,8 @@ Comments say "Primary LLM — Groq" but `provider.py` tries OpenAI first. Update
 
 ## 💡 Features Not Yet Implemented
 
-### FEAT-01 · No duplicate booking detection
-A guest can book the same room type for the same dates multiple times. Add a check in `create_reservation_tool` or `operations.py` to detect overlapping bookings for the same email.
+### ~~FEAT-01 · No duplicate booking detection~~
+~~A guest can book the same room type for the same dates multiple times. Add a check in `create_reservation_tool` or `operations.py` to detect overlapping bookings for the same email.~~
 
 ### FEAT-02 · No conversation export for guests
 Guests cannot download their chat history or a summary of their reservation. A `/conversation/{id}/export` endpoint returning plain text or PDF would be useful.
