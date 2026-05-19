@@ -148,17 +148,17 @@ Three separate files for prompts makes tuning difficult. Consolidate into a sing
 ~~**Files:** `app/db/models.py`, `app/db/operations.py`~~  
 ~~Both files have excessive blank lines between statements inside functions. Apply `black` formatter across the project for consistent style.~~
 
-### CLEAN-07 · Tests only cover `/chat`, not `/chat/stream`
-**Files:** `tests/test_api.py`  
-All tests use the non-streaming `/chat` endpoint. The streaming endpoint (`/chat/stream`) — the only path real users take — has zero test coverage. Add at minimum smoke tests that assert the stream returns non-empty content for each intent.
+### ~~CLEAN-07 · Tests only cover `/chat`, not `/chat/stream`~~
+~~**Files:** `tests/test_api.py`~~  
+~~All tests use the non-streaming `/chat` endpoint. The streaming endpoint (`/chat/stream`) — the only path real users take — has zero test coverage. Add at minimum smoke tests that assert the stream returns non-empty content for each intent.~~
 
 ### CLEAN-08 · SQLite unsuitable for concurrent production load
 **Files:** `app/db/database.py`  
 SQLite serialises writes. Under concurrent reservation creation from multiple users, write throughput will degrade and WAL-mode issues can appear. Migrate to PostgreSQL before going to production with real traffic.
 
-### CLEAN-09 · Docker Compose port mapping is undocumented
-**Files:** `docker-compose.yml`  
-`"8000:7860"` maps an external port to the internal Uvicorn port. This is valid but confusing. Add a comment or align the port numbers so it's clear which is the public-facing port.
+### ~~CLEAN-09 · Docker Compose port mapping is undocumented~~
+~~**Files:** `docker-compose.yml`~~  
+~~`"8000:7860"` maps an external port to the internal Uvicorn port. This is valid but confusing. Add a comment or align the port numbers so it's clear which is the public-facing port.~~
 
 ### ~~CLEAN-10 · `.env.example` documents Groq as primary LLM~~
 ~~**Files:** `.env.example`~~  
