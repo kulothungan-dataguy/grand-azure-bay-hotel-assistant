@@ -1,4 +1,14 @@
-RAG_PROMPT = """
+import logging
+import os
+
+_logger = logging.getLogger("hotel_ai_assistant")
+
+# ---------------------------------------------------------------------------
+# Hardcoded defaults — source of truth when LangSmith Hub is unavailable.
+# These are also what gets pushed to the Hub via scripts/push_prompts.py.
+# ---------------------------------------------------------------------------
+
+_RAG_PROMPT_DEFAULT = """
 You are a friendly hotel concierge assistant for Grand Azure Bay Hotel.
 
 Answer using the provided context. If the context has related information but not the exact detail asked (e.g. guest asks for a street address but context has city and distance landmarks), share what IS available and note what is missing.
@@ -11,7 +21,7 @@ Question:
 {question}
 """
 
-INTENT_PROMPT = """
+_INTENT_PROMPT_DEFAULT = """
 You are an AI hotel assistant.
 
 Previous Conversation:
@@ -41,7 +51,7 @@ Current User Query:
 {query}
 """
 
-EXTRACTION_PROMPT = """
+_EXTRACTION_PROMPT_DEFAULT = """
 Extract reservation details from the conversation. Return null for any field the user has not explicitly stated. Do not guess or invent values.
 
 Today's date is {today}. Use this to resolve relative dates:
@@ -53,3 +63,38 @@ Always return dates in YYYY-MM-DD format.
 Chat history: {chat_history}
 User: {query}
 """
+
+
+# ---------------------------------------------------------------------------
+# Hub pull — fetches a versioned prompt string from LangSmith Hub.
+# Falls back to the hardcoded default if LANGCHAIN_API_KEY is not set or
+# if the Hub call fails (network error, bad commit hash, etc.).
+# Prompts are resolved once at server startup and cached as module globals.
+# ---------------------------------------------------------------------------
+
+def _pull(repo: str, fallback: str) -> str:
+    if not os.getenv("LANGCHAIN_API_KEY"):
+        return fallback
+    try:
+        from langchain import hub
+        variant = os.getenv("PROMPT_VARIANT", "latest")
+        ref = f"{repo}:{variant}" if variant != "latest" else repo
+        obj = hub.pull(ref)
+        # PromptTemplate exposes .template; ChatPromptTemplate needs .messages[0].prompt.template
+        template = getattr(obj, "template", None)
+        if template is None and hasattr(obj, "messages"):
+            template = obj.messages[0].prompt.template
+        if template:
+            _logger.info("langsmith_hub_pull", extra={"repo": repo, "ref": ref})
+            return template
+        raise ValueError(f"Could not extract template string from {type(obj)}")
+    except Exception as exc:
+        _logger.warning(
+            "LangSmith Hub pull failed for %s (%s) — using hardcoded fallback", repo, exc
+        )
+        return fallback
+
+
+RAG_PROMPT        = _pull("hotel-assistant/rag-prompt",         _RAG_PROMPT_DEFAULT)
+INTENT_PROMPT     = _pull("hotel-assistant/intent-classifier",  _INTENT_PROMPT_DEFAULT)
+EXTRACTION_PROMPT = _pull("hotel-assistant/extraction",         _EXTRACTION_PROMPT_DEFAULT)

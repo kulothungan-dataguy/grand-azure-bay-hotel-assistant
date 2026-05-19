@@ -1,4 +1,5 @@
 import json
+import os
 import time
 import uuid
 from pathlib import Path
@@ -275,6 +276,7 @@ async def chat_stream(payload: ChatRequest):
         extra={
             "conversation_id": conversation_id,
             "intent": intent,
+            "prompt_variant": os.getenv("PROMPT_VARIANT", "latest"),
             "prompt_tokens": cb.prompt_tokens,
             "completion_tokens": cb.completion_tokens,
         },

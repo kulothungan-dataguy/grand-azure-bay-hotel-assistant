@@ -174,8 +174,8 @@ SQLite serialises writes. Under concurrent reservation creation from multiple us
 ### FEAT-02 · No conversation export for guests
 Guests cannot download their chat history or a summary of their reservation. A `/conversation/{id}/export` endpoint returning plain text or PDF would be useful.
 
-### FEAT-03 · No A/B testing infrastructure for prompts
-Prompts are hardcoded with no mechanism to run two versions and compare intent accuracy or response quality. A simple flag in config and split logging would enable prompt experimentation.
+### ~~FEAT-03 · No A/B testing infrastructure for prompts~~
+~~Prompts are hardcoded with no mechanism to run two versions and compare intent accuracy or response quality. A simple flag in config and split logging would enable prompt experimentation.~~
 
 ### ~~FEAT-04 · No structured logging for LLM prompt/response pairs~~
 Token counts are logged but not the actual prompts or responses. This makes debugging LLM failures (hallucinations, wrong intent, bad extraction) very difficult. Log the full prompt and response at DEBUG level with the request ID.
