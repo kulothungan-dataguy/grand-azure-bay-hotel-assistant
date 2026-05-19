@@ -2,12 +2,12 @@ from app.db.database import get_connection
 
 
 def create_reservation(
-    guest_name,
-    email,
-    room_type,
-    check_in_date,
-    check_out_date
-):
+    guest_name: str,
+    email: str,
+    room_type: str,
+    check_in_date: str,
+    check_out_date: str,
+) -> int:
     conn = get_connection()
     try:
         cursor = conn.cursor()
@@ -33,7 +33,7 @@ def create_reservation(
         conn.close()
 
 
-def get_reservation(reservation_id):
+def get_reservation(reservation_id: int) -> dict | None:
     conn = get_connection()
     try:
         cursor = conn.cursor()
@@ -41,12 +41,13 @@ def get_reservation(reservation_id):
         SELECT * FROM reservations
         WHERE reservation_id = ?
         """, (reservation_id,))
-        return cursor.fetchone()
+        row = cursor.fetchone()
+        return dict(row) if row else None
     finally:
         conn.close()
 
 
-def get_reservations_by_email(email):
+def get_reservations_by_email(email: str) -> list[dict]:
     conn = get_connection()
     try:
         cursor = conn.cursor()
@@ -60,7 +61,11 @@ def get_reservations_by_email(email):
         conn.close()
 
 
-def create_escalation(conversation_id: str, query: str, guest_email: str = None) -> int:
+def create_escalation(
+    conversation_id: str,
+    query: str,
+    guest_email: str | None = None,
+) -> int:
     conn = get_connection()
     try:
         cursor = conn.cursor()
@@ -74,7 +79,7 @@ def create_escalation(conversation_id: str, query: str, guest_email: str = None)
         conn.close()
 
 
-def get_pending_escalations() -> list:
+def get_pending_escalations() -> list[dict]:
     conn = get_connection()
     try:
         cursor = conn.cursor()
@@ -102,7 +107,7 @@ def resolve_escalation(escalation_id: int) -> bool:
         conn.close()
 
 
-def cancel_reservation(reservation_id):
+def cancel_reservation(reservation_id: int) -> bool:
     conn = get_connection()
     try:
         cursor = conn.cursor()

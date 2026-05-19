@@ -20,8 +20,14 @@ fallback_stats: dict[str, int] = {
     "primary_errors": 0,
 }
 
-_FAILURE_THRESHOLD = 3   # consecutive failures before opening the circuit
-_RECOVERY_TIMEOUT  = 30  # seconds to wait before retrying OpenAI
+# Open the circuit after this many consecutive failures so we stop hammering
+# a known-broken endpoint and route immediately to Groq.
+_FAILURE_THRESHOLD = 3
+
+# After the circuit opens, wait this many seconds before probing OpenAI again
+# (HALF_OPEN state). 30 s is long enough to survive a transient blip without
+# incurring minutes of unavailability.
+_RECOVERY_TIMEOUT = 30
 
 
 class _CircuitBreaker:

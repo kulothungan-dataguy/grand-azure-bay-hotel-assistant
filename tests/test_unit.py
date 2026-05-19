@@ -103,7 +103,7 @@ def test_is_active_missing_fields_returns_false():
 def test_append_assistant_reply_stores_both_roles():
     from app.api.server import _append_assistant_reply
     memory = {"chat_history": [{"role": "user", "content": "Hi"}]}
-    _append_assistant_reply(memory, "Hello!")
+    _append_assistant_reply("test-conv", memory, "Hello!")
     roles = [m["role"] for m in memory["chat_history"]]
     assert roles == ["user", "assistant"]
 
@@ -113,7 +113,7 @@ def test_append_assistant_reply_trims_to_window():
     memory = {"chat_history": []}
     for i in range(10):
         memory["chat_history"].append({"role": "user", "content": f"msg {i}"})
-        _append_assistant_reply(memory, f"reply {i}")
+        _append_assistant_reply("test-conv", memory, f"reply {i}")
     assert len(memory["chat_history"]) <= _HISTORY_WINDOW
 
 
@@ -122,6 +122,6 @@ def test_append_assistant_reply_keeps_most_recent():
     memory = {"chat_history": []}
     for i in range(5):
         memory["chat_history"].append({"role": "user", "content": f"msg {i}"})
-        _append_assistant_reply(memory, f"reply {i}")
+        _append_assistant_reply("test-conv", memory, f"reply {i}")
     # Last message should be the most recent assistant reply
     assert memory["chat_history"][-1]["content"] == "reply 4"

@@ -1,6 +1,6 @@
-import hashlib
 import json
 import time
+import uuid
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -16,7 +16,7 @@ from app.rag.prompts import INTENT_PROMPT
 from app.schemas.intent_schema import IntentOutput
 from app.db.models import create_tables
 from app.db.operations import create_escalation, get_pending_escalations, resolve_escalation
-from app.utils.logger import logger
+from app.utils.logger import logger, request_id_var
 from app.schemas.api_schemas import ChatRequest, ChatResponse, EscalationRequest
 from app.memory.store import conversation_memory
 from app.cache.store import rag_cache as _rag_cache
@@ -35,8 +35,25 @@ def root():
 
 
 # ---------------------------------------------------------------------------
-# Latency middleware
+# Middleware — applied in reverse registration order (last registered = outermost)
 # ---------------------------------------------------------------------------
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    """Generates a UUID per request, sets it in a ContextVar so every log line
+    emitted during that request carries the same request_id, and echoes it back
+    in the X-Request-Id response header for client-side correlation."""
+
+    async def dispatch(self, request: Request, call_next):
+        rid = str(uuid.uuid4())
+        request.state.request_id = rid
+        token = request_id_var.set(rid)
+        try:
+            response = await call_next(request)
+            response.headers["X-Request-Id"] = rid
+            return response
+        finally:
+            request_id_var.reset(token)
+
 
 class LatencyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -56,6 +73,7 @@ class LatencyMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(LatencyMiddleware)
+app.add_middleware(RequestIdMiddleware)
 
 
 # ---------------------------------------------------------------------------
@@ -63,17 +81,21 @@ app.add_middleware(LatencyMiddleware)
 # ---------------------------------------------------------------------------
 
 def _get_or_init_memory(conversation_id: str) -> dict:
-    if conversation_id not in conversation_memory:
-        conversation_memory[conversation_id] = {
+    mem = conversation_memory.get(conversation_id)
+    if mem is None:
+        mem = {
             "chat_history": [],
             "history_summary": "",   # compact text of messages trimmed from the window
             "current_reservation": None,
             "pending_cancel": None,
         }
-    return conversation_memory[conversation_id]
+        conversation_memory.save(conversation_id, mem)
+    return mem
 
 
-_HISTORY_WINDOW = 6  # 3 full exchanges (user + assistant pairs)
+# Keep the last 3 full turn-pairs (user + assistant) in the active window.
+# Older messages are summarised into history_summary rather than discarded.
+_HISTORY_WINDOW = 6
 
 _CONFIRM = {"yes", "yeah", "yep", "sure", "confirm", "confirmed", "ok", "okay", "proceed", "do it", "go ahead", "yes please"}
 _DENY    = {"no", "nope", "don't", "dont", "stop", "abort", "never mind", "nevermind", "keep it", "cancel that"}
@@ -94,7 +116,7 @@ def _extract_pending_cancel(response: dict) -> dict | None:
     return response.get("pending_cancel") or None
 
 
-def _append_assistant_reply(memory: dict, text: str) -> None:
+def _append_assistant_reply(conversation_id: str, memory: dict, text: str) -> None:
     memory["chat_history"].append({"role": "assistant", "content": text})
     if len(memory["chat_history"]) > _HISTORY_WINDOW:
         overflow = memory["chat_history"][:-_HISTORY_WINDOW]
@@ -105,6 +127,7 @@ def _append_assistant_reply(memory: dict, text: str) -> None:
         existing = memory.get("history_summary", "")
         memory["history_summary"] = f"{existing} | {compact}".strip(" |") if existing else compact
         memory["chat_history"] = memory["chat_history"][-_HISTORY_WINDOW:]
+    conversation_memory.save(conversation_id, memory)
 
 
 def _log_drift(intent: str, query_len: int) -> None:
@@ -141,13 +164,13 @@ def chat(payload: ChatRequest):
             result = cancel_reservation_tool(pending["reservation_id"], pending["email"])
             memory["pending_cancel"] = None
             _log_drift("cancel_reservation", len(query))
-            _append_assistant_reply(memory, str(result))
+            _append_assistant_reply(conversation_id, memory, str(result))
             return ChatResponse(response=str(result), intent="cancel_reservation")
         elif _is_denial(query):
             memory["pending_cancel"] = None
             _log_drift("cancel_reservation", len(query))
             reply = "No problem! Your reservation is still active."
-            _append_assistant_reply(memory, reply)
+            _append_assistant_reply(conversation_id, memory, reply)
             return ChatResponse(response=reply, intent="cancel_reservation")
 
     with get_openai_callback() as cb:
@@ -185,7 +208,7 @@ def chat(payload: ChatRequest):
     if response.get("reservation_data"):
         memory["current_reservation"] = response["reservation_data"]
 
-    _append_assistant_reply(memory, response["response"])
+    _append_assistant_reply(conversation_id, memory, response["response"])
     return ChatResponse(
         response=response["response"],
         intent=response["intent"],
@@ -220,7 +243,7 @@ async def chat_stream(payload: ChatRequest):
             memory["pending_cancel"] = None
             _log_drift("cancel_reservation", len(query))
             confirm_text = str(result)
-            _append_assistant_reply(memory, confirm_text)
+            _append_assistant_reply(conversation_id, memory, confirm_text)
             async def confirm_stream():
                 yield confirm_text
             return StreamingResponse(confirm_stream(), media_type="text/plain")
@@ -228,7 +251,7 @@ async def chat_stream(payload: ChatRequest):
             memory["pending_cancel"] = None
             _log_drift("cancel_reservation", len(query))
             deny_text = "No problem! Your reservation is still active."
-            _append_assistant_reply(memory, deny_text)
+            _append_assistant_reply(conversation_id, memory, deny_text)
             async def deny_stream():
                 yield deny_text
             return StreamingResponse(deny_stream(), media_type="text/plain")
@@ -262,7 +285,7 @@ async def chat_stream(payload: ChatRequest):
         cache_key, cached_text = check_rag_cache(query)
         if cached_text:
             logger.info("rag_cache_hit", extra={"query": query})
-            _append_assistant_reply(memory, cached_text)
+            _append_assistant_reply(conversation_id, memory, cached_text)
             async def cached_stream():
                 yield cached_text
             return StreamingResponse(cached_stream(), media_type="text/plain")
@@ -277,7 +300,7 @@ async def chat_stream(payload: ChatRequest):
                     yield chunk.content
             response_text = "".join(full_response)
             save_rag_response(cache_key, response_text)
-            _append_assistant_reply(memory, response_text)
+            _append_assistant_reply(conversation_id, memory, response_text)
 
         return StreamingResponse(generate(), media_type="text/plain")
     
@@ -297,7 +320,7 @@ async def chat_stream(payload: ChatRequest):
                 if chunk.content:
                     full_response.append(chunk.content)
                     yield chunk.content
-            _append_assistant_reply(memory, "".join(full_response))
+            _append_assistant_reply(conversation_id, memory, "".join(full_response))
 
         return StreamingResponse(gen_stream(), media_type="text/plain")
 
@@ -336,7 +359,7 @@ async def chat_stream(payload: ChatRequest):
             memory["current_reservation"] = response["reservation_data"]
 
         reply_text = response["response"]
-        _append_assistant_reply(memory, reply_text)
+        _append_assistant_reply(conversation_id, memory, reply_text)
 
         async def single_chunk():
             yield reply_text

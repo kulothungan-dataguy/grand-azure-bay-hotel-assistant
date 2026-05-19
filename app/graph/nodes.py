@@ -50,7 +50,7 @@ def build_rag_prompt(query: str) -> str:
 
 def save_rag_response(cache_key: str, text: str) -> None:
     if is_cacheable(text):
-        _rag_cache.set(cache_key, {"response": text}, expire=86400)
+        _rag_cache.set(cache_key, {"response": text}, expire=86400)  # 24 hours
     else:
         logger.info("rag_cache_skip_fallback")
 

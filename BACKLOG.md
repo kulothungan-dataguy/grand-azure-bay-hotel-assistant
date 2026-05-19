@@ -50,13 +50,13 @@ Guest email is injected raw into the LLM system prompt. Any phone number or pers
 
 ## 🟠 High — Fix Before Scale
 
-### ARCH-01 · In-memory session store resets on every restart
-**Files:** `app/memory/store.py`  
-`conversation_memory = {}` is a plain Python dict. All active conversations are lost on redeploy or crash. Replace with Redis (`redis-py`) or a lightweight SQLite-backed store for persistence across restarts.
+### ~~ARCH-01 · In-memory session store resets on every restart~~
+~~**Files:** `app/memory/store.py`~~  
+~~`conversation_memory = {}` is a plain Python dict. All active conversations are lost on redeploy or crash. Replace with Redis (`redis-py`) or a lightweight SQLite-backed store for persistence across restarts.~~
 
-### ARCH-02 · Session store grows unboundedly
-**Files:** `app/memory/store.py`, `app/api/server.py`  
-Conversations are never evicted. Under sustained load the dict grows forever. Add a TTL-based eviction (e.g. remove conversations not accessed in 24 hours) or use Redis with key expiry.
+### ~~ARCH-02 · Session store grows unboundedly~~
+~~**Files:** `app/memory/store.py`, `app/api/server.py`~~  
+~~Conversations are never evicted. Under sustained load the dict grows forever. Add a TTL-based eviction (e.g. remove conversations not accessed in 24 hours) or use Redis with key expiry.~~
 
 ### ~~ARCH-03 · Streaming logic duplicated from graph nodes~~
 **Files:** `app/api/server.py:262–317`, `app/graph/nodes.py:34–54, 216–234`  
@@ -128,25 +128,25 @@ When OpenAI is down every request waits for the full HTTP timeout before falling
 **Files:** `app/graph/nodes.py`, `app/graph/workflow.py`  
 Since the frontend always calls `/chat/stream`, `rag_node`, `general_node`, and `intent_router_node` are never exercised by real users — only by direct `/chat` calls (tests, curl). If `/chat` is ever removed these nodes become dead code. Document this explicitly or consolidate via `astream_events` (see ARCH-03).
 
-### CLEAN-02 · No request ID for end-to-end tracing
-**Files:** `app/api/server.py`  
-No `request_id` is threaded through LLM, DB, and cache calls. When a user reports a bad response there is no way to correlate the frontend log entry with the backend LLM call. Generate a UUID per request in middleware and attach it to all log entries for that request.
+### ~~CLEAN-02 · No request ID for end-to-end tracing~~
+~~**Files:** `app/api/server.py`~~  
+~~No `request_id` is threaded through LLM, DB, and cache calls. When a user reports a bad response there is no way to correlate the frontend log entry with the backend LLM call. Generate a UUID per request in middleware and attach it to all log entries for that request.~~
 
 ### ~~CLEAN-03 · Prompts scattered across multiple modules~~
 **Files:** `app/rag/prompts.py`, `app/rag/intent_prompt.py`, `app/rag/extraction_prompt.py`  
 Three separate files for prompts makes tuning difficult. Consolidate into a single `app/rag/prompts.py` with versioned constants (e.g. `INTENT_PROMPT_V2`) so prompt changes are easy to track and compare.
 
-### CLEAN-04 · Magic numbers without rationale
-**Files:** `app/api/server.py` (`_HISTORY_WINDOW = 6`), `app/rag/ingest.py` (chunk size)  
-Add a comment explaining why each constant has its specific value so future maintainers know whether they can safely change it.
+### ~~CLEAN-04 · Magic numbers without rationale~~
+~~**Files:** `app/api/server.py` (`_HISTORY_WINDOW = 6`), `app/llm/provider.py` (thresholds), `app/graph/nodes.py` (cache TTL)~~  
+~~Add a comment explaining why each constant has its specific value so future maintainers know whether they can safely change it.~~
 
-### CLEAN-05 · Incomplete type hints
-**Files:** `app/db/operations.py`, `app/tools/reservation_tools.py`, `app/graph/nodes.py`  
-Many function parameters use bare `dict` instead of `dict[str, Any]`. Function return types are often missing. Run `mypy --strict` and fix the gaps for better IDE support and earlier bug detection.
+### ~~CLEAN-05 · Incomplete type hints~~
+~~**Files:** `app/db/operations.py`, `app/tools/reservation_tools.py`~~  
+~~Many function parameters use bare `dict` instead of `dict[str, Any]`. Function return types are often missing. Run `mypy --strict` and fix the gaps for better IDE support and earlier bug detection.~~
 
-### CLEAN-06 · Inconsistent whitespace in `models.py` and `operations.py`
-**Files:** `app/db/models.py`, `app/db/operations.py`  
-Both files have excessive blank lines between statements inside functions. Apply `black` formatter across the project for consistent style.
+### ~~CLEAN-06 · Inconsistent whitespace in `models.py` and `operations.py`~~
+~~**Files:** `app/db/models.py`, `app/db/operations.py`~~  
+~~Both files have excessive blank lines between statements inside functions. Apply `black` formatter across the project for consistent style.~~
 
 ### CLEAN-07 · Tests only cover `/chat`, not `/chat/stream`
 **Files:** `tests/test_api.py`  
@@ -160,9 +160,9 @@ SQLite serialises writes. Under concurrent reservation creation from multiple us
 **Files:** `docker-compose.yml`  
 `"8000:7860"` maps an external port to the internal Uvicorn port. This is valid but confusing. Add a comment or align the port numbers so it's clear which is the public-facing port.
 
-### CLEAN-10 · `.env.example` documents Groq as primary LLM
-**Files:** `.env.example`  
-Comments say "Primary LLM — Groq" but `provider.py` tries OpenAI first. Update the example file to reflect the actual priority order.
+### ~~CLEAN-10 · `.env.example` documents Groq as primary LLM~~
+~~**Files:** `.env.example`~~  
+~~Comments say "Primary LLM — Groq" but `provider.py` tries OpenAI first. Update the example file to reflect the actual priority order.~~
 
 ---
 
