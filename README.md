@@ -1,3 +1,12 @@
+---
+title: Grand Azure Bay API
+emoji: 🏨
+colorFrom: blue
+colorTo: yellow
+sdk: docker
+pinned: false
+---
+
 # Grand Azure Bay Hotel — AI Reservation Assistant
 
 An AI-powered hotel concierge built with **LangGraph**, **RAG (FAISS + GPT-4o-mini)**, and **FastAPI**. Guests can ask hotel questions, book rooms, view and cancel reservations through natural conversation — with a structured booking form, email-based ownership verification, and human escalation for unanswered questions.
