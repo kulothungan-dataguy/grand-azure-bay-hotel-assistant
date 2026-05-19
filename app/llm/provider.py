@@ -61,6 +61,25 @@ class _CircuitBreaker:
 _circuit = _CircuitBreaker()
 
 
+class _FallbackStructuredOutput:
+    """Wraps a structured-output runnable and falls back to Groq on failure."""
+
+    def __init__(self, primary, fallback):
+        self._primary = primary
+        self._fallback = fallback
+
+    def invoke(self, prompt):
+        from app.utils.logger import logger
+        try:
+            return self._primary.invoke(prompt)
+        except Exception as e:
+            logger.error(f"OpenAI structured output failed: {e}")
+            if self._fallback:
+                logger.info("Falling back to Groq for structured output")
+                return self._fallback.invoke(prompt)
+            raise
+
+
 class FallbackLLM:
     def __init__(self):
         self.primary_llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0, max_tokens=1024)
@@ -82,6 +101,18 @@ class FallbackLLM:
         response = self.fallback_llm.invoke(prompt)
         logger.debug("llm_response_fallback", extra={"response": response.content[:2000]})
         return response
+
+    async def _astream_fallback(self, prompt, logger):
+        if not self.fallback_llm:
+            raise RuntimeError("OpenAI is unavailable and no fallback LLM is configured.")
+        fallback_stats["fallback_calls"] += 1
+        logger.info("Falling back to Groq (streaming)")
+        full = []
+        async for chunk in self.fallback_llm.astream(prompt):
+            if chunk.content:
+                full.append(chunk.content)
+            yield chunk
+        logger.debug("llm_astream_fallback", extra={"response": "".join(full)[:2000]})
 
     def invoke(self, prompt):
         from app.utils.logger import logger
@@ -105,7 +136,10 @@ class FallbackLLM:
             return self._use_fallback(prompt, logger)
 
     def with_structured_output(self, schema):
-        return self.primary_llm.with_structured_output(schema)
+        return _FallbackStructuredOutput(
+            primary=self.primary_llm.with_structured_output(schema),
+            fallback=self.fallback_llm.with_structured_output(schema) if self.fallback_llm else None,
+        )
 
     async def astream(self, prompt):
         from app.utils.logger import logger
@@ -115,8 +149,8 @@ class FallbackLLM:
 
         if _circuit.is_open:
             logger.warning("circuit_open_skipping_openai")
-            result = self._use_fallback(prompt, logger)
-            yield result
+            async for chunk in self._astream_fallback(prompt, logger):
+                yield chunk
             return
 
         full_response = []
@@ -131,9 +165,8 @@ class FallbackLLM:
             fallback_stats["primary_errors"] += 1
             _circuit.record_failure()
             logger.error(f"OpenAI astream failed: {e}")
-            result = self._use_fallback(prompt, logger)
-            logger.debug("llm_astream_fallback", extra={"response": result.content[:2000]})
-            yield result
+            async for chunk in self._astream_fallback(prompt, logger):
+                yield chunk
 
 
 def get_llm():

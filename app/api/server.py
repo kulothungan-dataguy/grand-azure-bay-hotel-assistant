@@ -1,6 +1,5 @@
 import hashlib
 import json
-import re
 import time
 from pathlib import Path
 
@@ -90,21 +89,9 @@ def _is_denial(query: str) -> bool:
     return q in _DENY or any(w in q for w in ["no", "don't", "abort", "never mind", "stop", "keep"])
 
 
-def _extract_pending_cancel(response: dict, memory: dict) -> dict | None:
-    """
-    Primary: use graph state if it returned pending_cancel.
-    Fallback: detect the confirmation prompt from response text so the server
-    sets pending_cancel even if LangGraph doesn't propagate the field cleanly.
-    """
-    if response.get("pending_cancel"):
-        return response["pending_cancel"]
-    reply_text = response.get("response", "") or ""
-    if "are you sure you want to cancel" in reply_text.lower():
-        id_match = re.search(r"Reservation #(\d+)", reply_text)
-        email = memory.get("user_email") or (memory.get("current_reservation") or {}).get("email")
-        if id_match and email:
-            return {"reservation_id": int(id_match.group(1)), "email": email}
-    return None
+def _extract_pending_cancel(response: dict) -> dict | None:
+    """Read pending_cancel from the graph's structured state output."""
+    return response.get("pending_cancel") or None
 
 
 def _append_assistant_reply(memory: dict, text: str) -> None:
@@ -192,7 +179,7 @@ def chat(payload: ChatRequest):
 
     _log_drift(response.get("intent", "unknown"), len(query))
 
-    pending_cancel = _extract_pending_cancel(response, memory)
+    pending_cancel = _extract_pending_cancel(response)
     if pending_cancel:
         memory["pending_cancel"] = pending_cancel
     if response.get("reservation_data"):
@@ -339,7 +326,7 @@ async def chat_stream(payload: ChatRequest):
             },
         )
 
-        pending_cancel = _extract_pending_cancel(response, memory)
+        pending_cancel = _extract_pending_cancel(response)
         if pending_cancel:
             memory["pending_cancel"] = pending_cancel
         if response.get("reservation_id"):

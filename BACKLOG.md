@@ -89,9 +89,9 @@ yield result                                # one chunk, not streamed
 ```
 Use `self.fallback_llm.astream(prompt)` instead.
 
-### ARCH-07 · No DB schema migration framework
-**Files:** `app/db/models.py`  
-Tables are created with `CREATE TABLE IF NOT EXISTS`. Any schema change (adding a column, index, constraint) has no versioning. Add Alembic for migration tracking before the schema needs to evolve.
+### ~~ARCH-07 · No DB schema migration framework~~
+~~**Files:** `app/db/models.py`~~  
+~~Tables are created with `CREATE TABLE IF NOT EXISTS`. Any schema change (adding a column, index, constraint) has no versioning. Add Alembic for migration tracking before the schema needs to evolve.~~
 
 ---
 
