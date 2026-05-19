@@ -24,6 +24,28 @@ def create_reservation_tool(
     check_in_date,
     check_out_date
 ):
+    check_in = date.fromisoformat(str(check_in_date))
+    check_out = date.fromisoformat(str(check_out_date))
+
+    existing = get_reservations_by_email(email)
+    for r in existing:
+        if r["status"] != "CONFIRMED":
+            continue
+        try:
+            r_in = date.fromisoformat(str(r["check_in_date"]))
+            r_out = date.fromisoformat(str(r["check_out_date"]))
+        except ValueError:
+            continue
+        # Overlapping if the new stay starts before existing ends AND ends after existing starts
+        if check_in < r_out and check_out > r_in:
+            return {
+                "message": (
+                    f"You already have a confirmed reservation (#{r['reservation_id']}) "
+                    f"for a {r['room_type']} room from {r_in} to {r_out} that overlaps with "
+                    f"your requested dates. Please cancel it first or choose different dates."
+                ),
+                "reservation_id": None,
+            }
 
     reservation_id = create_reservation(
         guest_name,
@@ -38,7 +60,7 @@ def create_reservation_tool(
             f"Reservation created successfully. "
             f"Reservation ID: {reservation_id}"
         ),
-        "reservation_id": reservation_id
+        "reservation_id": reservation_id,
     }
 
 

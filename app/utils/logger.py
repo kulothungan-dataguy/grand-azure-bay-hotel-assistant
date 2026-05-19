@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import time
 
 _SKIP_KEYS = {
@@ -29,6 +30,6 @@ _handler = logging.StreamHandler()
 _handler.setFormatter(_JsonFormatter())
 
 logger = logging.getLogger("hotel_ai_assistant")
-logger.setLevel(logging.INFO)
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 logger.handlers = [_handler]
 logger.propagate = False

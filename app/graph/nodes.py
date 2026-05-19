@@ -2,10 +2,9 @@ import hashlib
 from app.graph.state import AssistantState
 from app.llm.provider import get_llm
 from app.cache.store import rag_cache as _rag_cache, make_cache_key, is_cacheable
+from app.utils.pii import scrub_pii
 from app.rag.retriever import retriever
-from app.rag.prompts import RAG_PROMPT
-from app.rag.intent_prompt import INTENT_PROMPT
-from app.rag.extraction_prompt import EXTRACTION_PROMPT
+from app.rag.prompts import RAG_PROMPT, INTENT_PROMPT, EXTRACTION_PROMPT
 from app.schemas.intent_schema import IntentOutput, ReservationIDOutput
 from app.schemas.reservation_schema import ReservationData
 from app.tools.reservation_tools import (
@@ -31,26 +30,54 @@ def intent_router_node(state: AssistantState):
     return {"intent": result.intent}
 
 
-def rag_node(state: AssistantState):
-    query = state["query"]
+# ---------------------------------------------------------------------------
+# Shared helpers — used by both the graph nodes (/chat) and
+# the streaming endpoint (/chat/stream) to avoid duplicating logic.
+# ---------------------------------------------------------------------------
+
+def check_rag_cache(query: str) -> tuple[str, str | None]:
+    """Return (cache_key, cached_text) — cached_text is None on a miss."""
     cache_key = make_cache_key(query)
+    cached = _rag_cache.get(cache_key)
+    return cache_key, (cached["response"] if cached else None)
 
-    if cache_key in _rag_cache:
-        logger.info(f"RAG cache hit for: {query}")
-        cached = _rag_cache[cache_key]
-        return {"response": cached["response"]}
 
+def build_rag_prompt(query: str) -> str:
     docs = retriever.invoke(query)
     context = "\n\n".join(doc.page_content for doc in docs)
-    prompt = RAG_PROMPT.format(context=context, question=query)
+    return RAG_PROMPT.format(context=context, question=scrub_pii(query))
 
-    response = llm.invoke(prompt)
 
-    if is_cacheable(response.content):
-        _rag_cache.set(cache_key, {"response": response.content}, expire=86400)
+def save_rag_response(cache_key: str, text: str) -> None:
+    if is_cacheable(text):
+        _rag_cache.set(cache_key, {"response": text}, expire=86400)
     else:
-        logger.info(f"RAG cache skip (fallback response) for: {query}")
+        logger.info("rag_cache_skip_fallback")
 
+
+def build_general_prompt(query: str, chat_history: list, identity_ctx: str) -> str:
+    return (
+        f"You are a friendly hotel concierge assistant for Grand Azure Bay Hotel. "
+        f"{identity_ctx}"
+        f"Respond naturally to the guest's message.\n\n"
+        f"Chat history: {chat_history}\n"
+        f"Guest: {scrub_pii(query)}\nAssistant:"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Graph nodes
+# ---------------------------------------------------------------------------
+
+def rag_node(state: AssistantState):
+    query = state["query"]
+    cache_key, cached = check_rag_cache(query)
+    if cached:
+        logger.info("rag_cache_hit", extra={"query": query})
+        return {"response": cached}
+    prompt = build_rag_prompt(query)
+    response = llm.invoke(prompt)
+    save_rag_response(cache_key, response.content)
     return {"response": response.content}
 
 
@@ -73,6 +100,8 @@ _FIELD_LABELS = {
     "check_in_date":  "your check-in date",
     "check_out_date": "your check-out date",
 }
+
+_VALID_ROOM_TYPES = {"Standard", "Deluxe", "Suite"}
 
 
 def _missing_fields_response(data: dict) -> str | None:
@@ -97,6 +126,22 @@ def tool_node(state: AssistantState):
         ask = _missing_fields_response(data)
         if ask:
             return {"response": ask}
+
+        if data["room_type"] not in _VALID_ROOM_TYPES:
+            return {"response": f"Sorry, '{data['room_type']}' is not a valid room type. Please choose from: Standard, Deluxe, or Suite."}
+
+        from datetime import date as _date
+        try:
+            check_in = _date.fromisoformat(str(data["check_in_date"]))
+            check_out = _date.fromisoformat(str(data["check_out_date"]))
+        except ValueError:
+            return {"response": "The dates provided are invalid. Please use a format like 2026-07-01."}
+
+        if check_out <= check_in:
+            return {"response": "Check-out date must be after check-in date. Please provide valid dates."}
+
+        if check_in < _date.today():
+            return {"response": "Check-in date cannot be in the past. Please choose a future date."}
 
         result = create_reservation_tool(
             guest_name=data["guest_name"],
@@ -219,16 +264,10 @@ def general_node(state: AssistantState):
     reservation = state.get("current_reservation") or {}
     identity_ctx = ""
     if reservation.get("email"):
-        identity_ctx += f"The guest's email on file is {reservation['email']}. "
+        identity_ctx += "The guest's identity has been verified. "
     if reservation.get("guest_name"):
         identity_ctx += f"The guest's name on file is {reservation['guest_name']}. "
-    prompt = (
-        f"You are a friendly hotel concierge assistant for Grand Azure Bay Hotel. "
-        f"{identity_ctx}"
-        f"Respond naturally to the guest's message.\n\n"
-        f"Chat history: {chat_history}\n"
-        f"Guest: {query}\nAssistant:"
-    )
+    prompt = build_general_prompt(query, chat_history, identity_ctx)
     response = llm.invoke(prompt)
     return {"response": response.content}
 

@@ -226,14 +226,16 @@ if not st.session_state.user_email:
         with col2:
             email_submitted = st.form_submit_button("Continue", type="primary")
     if email_submitted:
-        if "@" in email_input and "." in email_input:
+        try:
+            from email_validator import validate_email, EmailNotValidError
+            validate_email(email_input.strip(), check_deliverability=False)
             st.session_state.user_email = email_input.strip()
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": "Welcome! How can I assist you today? You can ask about the hotel, book a room, or manage your reservations.",
             })
             st.rerun()
-        else:
+        except EmailNotValidError:
             st.error("Please enter a valid email address.")
     st.stop()
 
@@ -342,8 +344,12 @@ if st.session_state.pending_query:
     st.session_state.pending_query = None
     send(q)
 
-# ── Handle typed input ────────────────────────────────────────────────────────
-if user_input := st.chat_input("Ask about the hotel or manage your reservation…"):
+# ── Handle typed input — locked during active reservation flows ───────────────
+_chat_locked = st.session_state.show_booking_form or bool(st.session_state.cancel_res_ids)
+if user_input := st.chat_input(
+    "Ask about the hotel or manage your reservation…",
+    disabled=_chat_locked,
+):
     send(user_input)
 
 
@@ -360,7 +366,15 @@ if st.session_state.show_booking_form:
             today = date.today()
             check_in = st.date_input("Check-in Date", value=today + timedelta(days=1), min_value=today)
             check_out = st.date_input("Check-out Date", value=today + timedelta(days=2), min_value=today)
-        submitted = st.form_submit_button("Confirm Booking", type="primary")
+        col_confirm, col_cancel = st.columns([3, 1])
+        with col_confirm:
+            submitted = st.form_submit_button("Confirm Booking", type="primary", use_container_width=True)
+        with col_cancel:
+            cancelled = st.form_submit_button("Never mind", use_container_width=True)
+
+    if cancelled:
+        st.session_state.show_booking_form = False
+        st.rerun()
 
     if submitted:
         errors = []
@@ -410,7 +424,13 @@ if st.session_state.cancel_res_ids:
     st.markdown("---")
     st.markdown("**Select reservation to cancel:**")
     for res_id in st.session_state.cancel_res_ids:
-        if st.button(f"Cancel Reservation #{res_id}", key=f"cancel_bottom_{res_id}"):
-            st.session_state.cancel_res_ids = []
-            st.session_state.pending_query = f"Cancel reservation {res_id}"
-            st.rerun()
+        col_cancel, col_keep = st.columns([3, 1])
+        with col_cancel:
+            if st.button(f"Cancel Reservation #{res_id}", key=f"cancel_bottom_{res_id}", use_container_width=True):
+                st.session_state.cancel_res_ids = []
+                st.session_state.pending_query = f"Cancel reservation {res_id}"
+                st.rerun()
+        with col_keep:
+            if st.button("Don't cancel", key=f"keep_{res_id}", use_container_width=True):
+                st.session_state.cancel_res_ids = []
+                st.rerun()

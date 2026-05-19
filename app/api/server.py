@@ -12,17 +12,15 @@ from starlette.requests import Request
 from langchain_community.callbacks import get_openai_callback
 
 from app.graph.workflow import graph
-from app.graph.nodes import llm
-from app.rag.retriever import retriever
-from app.rag.prompts import RAG_PROMPT
-from app.rag.intent_prompt import INTENT_PROMPT
+from app.graph.nodes import llm, check_rag_cache, build_rag_prompt, save_rag_response, build_general_prompt
+from app.rag.prompts import INTENT_PROMPT
 from app.schemas.intent_schema import IntentOutput
 from app.db.models import create_tables
 from app.db.operations import create_escalation, get_pending_escalations, resolve_escalation
 from app.utils.logger import logger
 from app.schemas.api_schemas import ChatRequest, ChatResponse, EscalationRequest
 from app.memory.store import conversation_memory
-from app.cache.store import rag_cache as _rag_cache, make_cache_key, is_cacheable
+from app.cache.store import rag_cache as _rag_cache
 from app.llm.provider import fallback_stats
 
 _DRIFT_LOG = Path(".metrics/intent_log.jsonl")
@@ -69,6 +67,7 @@ def _get_or_init_memory(conversation_id: str) -> dict:
     if conversation_id not in conversation_memory:
         conversation_memory[conversation_id] = {
             "chat_history": [],
+            "history_summary": "",   # compact text of messages trimmed from the window
             "current_reservation": None,
             "pending_cancel": None,
         }
@@ -111,6 +110,13 @@ def _extract_pending_cancel(response: dict, memory: dict) -> dict | None:
 def _append_assistant_reply(memory: dict, text: str) -> None:
     memory["chat_history"].append({"role": "assistant", "content": text})
     if len(memory["chat_history"]) > _HISTORY_WINDOW:
+        overflow = memory["chat_history"][:-_HISTORY_WINDOW]
+        compact = " | ".join(
+            f"{'Guest' if m['role'] == 'user' else 'Bot'}: {m['content'][:120]}"
+            for m in overflow
+        )
+        existing = memory.get("history_summary", "")
+        memory["history_summary"] = f"{existing} | {compact}".strip(" |") if existing else compact
         memory["chat_history"] = memory["chat_history"][-_HISTORY_WINDOW:]
 
 
@@ -241,8 +247,14 @@ async def chat_stream(payload: ChatRequest):
             return StreamingResponse(deny_stream(), media_type="text/plain")
 
     # Classify intent (non-streaming — track tokens here)
+    summary = memory.get("history_summary", "")
+    history_for_prompt = (
+        [{"role": "system", "content": f"Earlier conversation summary: {summary}"}]
+        + memory["chat_history"]
+        if summary else memory["chat_history"]
+    )
     intent_prompt = INTENT_PROMPT.format(
-        chat_history=memory["chat_history"], query=query
+        chat_history=history_for_prompt, query=query
     )
     with get_openai_callback() as cb:
         intent_result = llm.with_structured_output(IntentOutput).invoke(intent_prompt)
@@ -260,21 +272,15 @@ async def chat_stream(payload: ChatRequest):
     _log_drift(intent, len(query))
 
     if intent == "hotel_qa":
-        cache_key = make_cache_key(query)
-        if cache_key in _rag_cache:
+        cache_key, cached_text = check_rag_cache(query)
+        if cached_text:
             logger.info("rag_cache_hit", extra={"query": query})
-            cached = _rag_cache[cache_key]
-            cached_text = cached["response"]
             _append_assistant_reply(memory, cached_text)
-
             async def cached_stream():
                 yield cached_text
-
             return StreamingResponse(cached_stream(), media_type="text/plain")
 
-        docs = retriever.invoke(query)
-        context = "\n\n".join(doc.page_content for doc in docs)
-        rag_prompt = RAG_PROMPT.format(context=context, question=query)
+        rag_prompt = build_rag_prompt(query)
 
         async def generate():
             full_response: list[str] = []
@@ -283,30 +289,21 @@ async def chat_stream(payload: ChatRequest):
                     full_response.append(chunk.content)
                     yield chunk.content
             response_text = "".join(full_response)
-            if is_cacheable(response_text):
-                _rag_cache.set(cache_key, {"response": response_text}, expire=86400)
-            else:
-                logger.info("rag_cache_skip_fallback", extra={"query": query})
+            save_rag_response(cache_key, response_text)
             _append_assistant_reply(memory, response_text)
 
         return StreamingResponse(generate(), media_type="text/plain")
     
     elif intent == "general_interactions":
         chat_history = memory.get("chat_history", [])
-        user_email = memory.get("user_email", "")
-        guest_name = (memory.get("current_reservation") or {}).get("guest_name", "")
         identity_ctx = ""
-        if user_email:
-            identity_ctx += f"The guest's email on file is {user_email}. "
+        if memory.get("user_email"):
+            identity_ctx += "The guest's identity has been verified. "
+        guest_name = (memory.get("current_reservation") or {}).get("guest_name", "")
         if guest_name:
             identity_ctx += f"The guest's name on file is {guest_name}. "
-        gen_prompt = (
-            f"You are a friendly hotel concierge assistant for Grand Azure Bay Hotel. "
-            f"{identity_ctx}"
-            f"Respond naturally to the guest's message.\n\n"
-            f"Chat history: {chat_history}\n"
-            f"Guest: {query}\nAssistant:"
-        )
+        gen_prompt = build_general_prompt(query, chat_history, identity_ctx)
+
         async def gen_stream():
             full_response: list[str] = []
             async for chunk in llm.astream(gen_prompt):
@@ -314,6 +311,7 @@ async def chat_stream(payload: ChatRequest):
                     full_response.append(chunk.content)
                     yield chunk.content
             _append_assistant_reply(memory, "".join(full_response))
+
         return StreamingResponse(gen_stream(), media_type="text/plain")
 
     else:
