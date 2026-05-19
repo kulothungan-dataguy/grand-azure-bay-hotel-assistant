@@ -32,6 +32,11 @@ app = FastAPI()
 create_tables()
 
 
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "Grand Azure Bay Hotel API", "docs": "/docs"}
+
+
 # ---------------------------------------------------------------------------
 # Latency middleware
 # ---------------------------------------------------------------------------
