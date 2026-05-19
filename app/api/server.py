@@ -293,8 +293,16 @@ async def chat_stream(payload: ChatRequest):
     
     elif intent == "general_interactions":
         chat_history = memory.get("chat_history", [])
+        user_email = memory.get("user_email", "")
+        guest_name = (memory.get("current_reservation") or {}).get("guest_name", "")
+        identity_ctx = ""
+        if user_email:
+            identity_ctx += f"The guest's email on file is {user_email}. "
+        if guest_name:
+            identity_ctx += f"The guest's name on file is {guest_name}. "
         gen_prompt = (
             f"You are a friendly hotel concierge assistant for Grand Azure Bay Hotel. "
+            f"{identity_ctx}"
             f"Respond naturally to the guest's message.\n\n"
             f"Chat history: {chat_history}\n"
             f"Guest: {query}\nAssistant:"

@@ -20,9 +20,9 @@ Rules:
 - create_reservation: Guest wants to make a new booking.
 - cancel_reservation: Guest wants to cancel a booking.
 - view_reservation: Guest wants to see their own reservation(s) — including follow-up questions like "what about my other reservations", "show active ones", "any other bookings".
-- general_interactions: Greetings, farewells, thanks, or unrelated small talk.
+- general_interactions: Greetings, farewells, thanks, unrelated small talk, OR questions about the guest's own personal details ("what is my name", "what email did I use", "what is my mail id"). Personal info questions are NOT view_reservation.
 - If the assistant previously asked for an email or reservation ID and the user is providing it, classify as the same intent as the previous turn (view_reservation or cancel_reservation).
-- When in doubt between view_reservation and general_interactions, prefer view_reservation if the conversation context is about reservations.
+- When in doubt between view_reservation and general_interactions, prefer view_reservation only if the query is clearly about bookings — not personal info.
 
 Current User Query:
 {query}
