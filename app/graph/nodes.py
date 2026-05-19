@@ -216,8 +216,15 @@ def tool_node(state: AssistantState):
 def general_node(state: AssistantState):
     query = state["query"]
     chat_history = state.get("chat_history", [])
+    reservation = state.get("current_reservation") or {}
+    identity_ctx = ""
+    if reservation.get("email"):
+        identity_ctx += f"The guest's email on file is {reservation['email']}. "
+    if reservation.get("guest_name"):
+        identity_ctx += f"The guest's name on file is {reservation['guest_name']}. "
     prompt = (
         f"You are a friendly hotel concierge assistant for Grand Azure Bay Hotel. "
+        f"{identity_ctx}"
         f"Respond naturally to the guest's message.\n\n"
         f"Chat history: {chat_history}\n"
         f"Guest: {query}\nAssistant:"
