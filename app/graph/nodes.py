@@ -240,6 +240,7 @@ def reject_node(state: AssistantState):
 
 
 def extract_reservation_node(state: AssistantState):
+    from datetime import date as _date
     query = state["query"]
     existing_reservation = state.get("current_reservation")
 
@@ -249,6 +250,7 @@ def extract_reservation_node(state: AssistantState):
     chat_history = state.get("chat_history", []) if existing_reservation else []
 
     prompt = EXTRACTION_PROMPT.format(
+        today=_date.today().isoformat(),
         chat_history=chat_history,
         query=query
     )
