@@ -344,13 +344,11 @@ if st.session_state.pending_query:
     st.session_state.pending_query = None
     send(q)
 
-# ── Handle typed input — locked during active reservation flows ───────────────
+# ── Handle typed input — hidden during active reservation flows ───────────────
 _chat_locked = st.session_state.show_booking_form or bool(st.session_state.cancel_res_ids)
-if user_input := st.chat_input(
-    "Ask about the hotel or manage your reservation…",
-    disabled=_chat_locked,
-):
-    send(user_input)
+if not _chat_locked:
+    if user_input := st.chat_input("Ask about the hotel or manage your reservation…"):
+        send(user_input)
 
 
 # ── Booking form (persists across reruns) ─────────────────────────────────────
