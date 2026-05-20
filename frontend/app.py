@@ -257,7 +257,7 @@ _ESCALATION_TRIGGERS = ["i don't have that information", "please contact our fro
 
 def _is_booking_ask(text: str) -> bool:
     lower = text.lower()
-    return sum(1 for p in _BOOKING_TRIGGERS if p in lower) >= 2
+    return sum(1 for p in _BOOKING_TRIGGERS if p in lower) >= 1
 
 def _is_cancel_query(text: str) -> bool:
     return "cancel" in text.lower()

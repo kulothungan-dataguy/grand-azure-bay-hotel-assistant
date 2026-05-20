@@ -60,6 +60,8 @@ Today's date is {today}. Use this to resolve relative dates:
 - "next Monday" = the coming Monday
 Always return dates in YYYY-MM-DD format.
 
+Important: A duration alone (e.g. "2 days", "a week", "3 nights") without an explicit start date does NOT tell you when check-in is. Return null for both check_in_date and check_out_date in that case.
+
 Chat history: {chat_history}
 User: {query}
 """
