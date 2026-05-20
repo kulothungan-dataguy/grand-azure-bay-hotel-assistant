@@ -75,24 +75,39 @@ def _parse_sections(pages: list) -> list[Document]:
 # Build FAISS index
 # ---------------------------------------------------------------------------
 
-loader = PyPDFLoader("doc/hotel_rag_document_v2.pdf")
-pages = loader.load()
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
 
-sections = _parse_sections(pages)
+    pdf_path = Path("doc/hotel_rag_document_v2.pdf")
+    if not pdf_path.exists():
+        print(f"ERROR: PDF not found at {pdf_path.resolve()}", file=sys.stderr)
+        sys.exit(1)
 
-print(f"Sections found: {len(sections)}")
-for s in sections:
-    print(f"  [{s.metadata['page']+1}] {s.metadata['section']!r}  ({len(s.page_content)} chars)")
+    try:
+        loader = PyPDFLoader(str(pdf_path))
+        pages = loader.load()
+    except Exception as e:
+        print(f"ERROR: Failed to load PDF: {e}", file=sys.stderr)
+        sys.exit(1)
 
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+    sections = _parse_sections(pages)
+    print(f"Sections found: {len(sections)}")
+    for s in sections:
+        print(f"  [{s.metadata['page']+1}] {s.metadata['section']!r}  ({len(s.page_content)} chars)")
 
-vectorstore = FAISS.from_documents(sections, embeddings)
-vectorstore.save_local("faiss_index")
-print("\nFAISS index rebuilt successfully")
+    try:
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        vectorstore = FAISS.from_documents(sections, embeddings)
+        vectorstore.save_local("faiss_index")
+        print("\nFAISS index rebuilt successfully")
+    except Exception as e:
+        print(f"ERROR: Failed to build FAISS index: {e}", file=sys.stderr)
+        sys.exit(1)
 
-# Clear RAG cache so stale answers don't persist after knowledge base update
-from app.cache.store import rag_cache
-rag_cache.clear()
-print("RAG cache cleared")
+    try:
+        from app.cache.store import rag_cache
+        rag_cache.clear()
+        print("RAG cache cleared")
+    except Exception as e:
+        print(f"WARNING: Could not clear RAG cache: {e}", file=sys.stderr)

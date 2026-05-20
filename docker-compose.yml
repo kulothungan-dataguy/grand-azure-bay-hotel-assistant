@@ -2,6 +2,8 @@ services:
   api:
     build: .
     ports:
+      # Container runs Uvicorn on 7860 (Hugging Face Spaces convention; see Dockerfile CMD).
+      # Mapped to host port 8000 so the API is reachable at http://localhost:8000.
       - "8000:7860"
     env_file: .env
     environment:

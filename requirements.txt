@@ -20,6 +20,12 @@ faiss-cpu==1.13.2
 pypdf==6.11.0
 sentence-transformers==5.5.0
 
+# DB migrations
+alembic==1.18.4
+
+# Session store
+redis==7.4.0
+
 # Data / validation
 pydantic==2.13.4
 email-validator==2.3.0

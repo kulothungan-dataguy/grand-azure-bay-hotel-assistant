@@ -1,6 +1,14 @@
+import contextvars
 import json
 import logging
+import os
 import time
+
+# Set by RequestIdMiddleware at the start of each HTTP request so every log
+# line emitted during that request carries the same request_id for correlation.
+request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id", default=""
+)
 
 _SKIP_KEYS = {
     "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
@@ -17,6 +25,9 @@ class _JsonFormatter(logging.Formatter):
             "level": record.levelname,
             "msg": record.getMessage(),
         }
+        rid = request_id_var.get()
+        if rid:
+            payload["request_id"] = rid
         for key, val in record.__dict__.items():
             if key not in _SKIP_KEYS and not key.startswith("_"):
                 payload[key] = val
@@ -29,6 +40,6 @@ _handler = logging.StreamHandler()
 _handler.setFormatter(_JsonFormatter())
 
 logger = logging.getLogger("hotel_ai_assistant")
-logger.setLevel(logging.INFO)
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 logger.handlers = [_handler]
 logger.propagate = False

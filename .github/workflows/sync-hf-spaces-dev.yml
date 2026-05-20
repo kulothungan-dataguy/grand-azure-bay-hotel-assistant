@@ -1,0 +1,47 @@
+name: Sync Dev to HF Spaces (Staging)
+
+on:
+  push:
+    branches: [dev]
+
+permissions:
+  contents: write
+
+jobs:
+  sync-backend-dev:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge dev into hf-backend-dev and push to HF
+        run: |
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git fetch origin
+          git checkout hf-backend-dev
+          git merge origin/dev --no-edit -X ours
+          git push origin hf-backend-dev
+          git remote add hf https://Real-Kulothungan:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/Real-Kulothungan/grand-azure-bay-api-dev
+          git push hf hf-backend-dev:main --force
+
+  sync-frontend-dev:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge dev into hf-frontend-dev and push to HF
+        run: |
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git fetch origin
+          git checkout hf-frontend-dev
+          git merge origin/dev --no-edit -X ours
+          git push origin hf-frontend-dev
+          git remote add hf https://Real-Kulothungan:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/Real-Kulothungan/grand-azure-bay-dev-staging
+          git push hf hf-frontend-dev:main --force
