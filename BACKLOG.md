@@ -346,3 +346,16 @@ The 85% threshold is a floor, not a trend. If accuracy regresses from 95% to 86%
 ### TEST-10 · Locust task weights do not reflect real traffic distribution
 **Files:** `locustfile.py`  
 Tasks are weighted `3:2:1` (hotel_qa : create : unsafe). In a real hotel chatbot, general interactions and view/cancel reservations are far more common than creates. Update weights to reflect realistic usage — this affects which bottlenecks surface during load testing.
+
+---
+
+### CLEAN-14 · `get_reservation()` is redundant — email already in session
+**Files:** `app/db/operations.py:36`, `app/graph/nodes.py:232`, `app/tools/reservation_tools.py:84`  
+`get_reservation(reservation_id)` fetches a single row by PK and is always followed by an email ownership check. Since `user_email` is always available in session, the same result can be achieved with `get_reservations_by_email(email)` filtered by ID — the ownership check becomes implicit (if the ID isn't in the list, it doesn't belong to that guest). The current function is a convenience wrapper that adds a dedicated DB round-trip and a separate ownership check step.  
+Fix: Remove `get_reservation()` from `operations.py`. Replace the 3 call sites in `nodes.py` and `reservation_tools.py` with `get_reservations_by_email(email)` + `next((r for r in results if r["reservation_id"] == id), None)`.  
+Note: Keep the PK-based query if a staff/admin endpoint is added later that looks up reservations without email context.
+
+### ARCH-08 · `intent_router_node` is a dead pass-through in the streaming path
+**Files:** `app/graph/workflow.py`, `app/graph/nodes.py:21`, `app/api/server.py`  
+`/chat/stream` (the only path real users take) classifies intent before calling `graph.invoke()` and passes it in state. `intent_router_node` detects `state.get("intent")` is already set and returns `{}` — a no-op. The node exists only to serve the non-streaming `/chat` endpoint (used in tests), which passes `intent: None` and lets the graph classify it internally. This creates a dual-path inconsistency: streaming classifies in the server, non-streaming classifies in the graph.  
+Fix: Move intent classification out of the graph entirely. Always classify in the server before `graph.invoke()` (for both `/chat` and `/chat/stream`). Remove `intent_router_node` from the graph and make `route_intent` the new entry point via `builder.set_entry_point("route")` or pass intent directly to the correct node. This eliminates the pass-through node and makes the architecture consistent across both endpoints.
