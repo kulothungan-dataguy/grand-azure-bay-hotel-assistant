@@ -1,26 +1,98 @@
 # Grand Azure Bay — Complete Codebase Walkthrough
 
-This document follows a single user request from the moment they type in the browser to the moment they see a response. Every file, every concept, and every important line is explained along the way.
+This document is the single reference for understanding the entire codebase. Read it top to bottom once and you will understand every file, every design decision, and every alternative that was considered and rejected. It follows a real user request from browser keystroke to database write.
 
 ---
 
 ## Mental Model — The Big Picture
 
 ```
-Browser (Streamlit)
-    │  HTTP POST /chat/stream
+Browser (Streamlit frontend)
+    │  HTTP POST /chat/stream  (streaming, text/plain)
     ▼
-FastAPI Server  ──► Intent Classifier (LLM)
+FastAPI Server (app/api/server.py)
     │
-    ├── hotel_qa          ──► RAG Pipeline ──► FAISS ──► LLM ──► Cache
-    ├── create_reservation ──► LangGraph ──► Extract Node ──► Tool Node ──► SQLite
-    ├── view_reservation   ──► LangGraph ──► Tool Node ──► SQLite
-    ├── cancel_reservation ──► LangGraph ──► Tool Node ──► SQLite
-    ├── general_interactions ──► LLM (inline, no graph)
-    └── unsafe            ──► LangGraph ──► Reject Node ──► "Access denied"
+    ├─ RequestIdMiddleware  ─── UUID per request → ContextVar → X-Request-Id header
+    ├─ LatencyMiddleware    ─── logs latency_ms for every endpoint
+    │
+    ├─ pending_cancel intercept  ─── yes/no short-circuits graph entirely
+    │
+    ├─ Intent Classifier (LLM)  ─── structured output → IntentOutput.intent
+    │
+    ├── hotel_qa          → build_rag_prompt() → FAISS → llm.astream() → StreamingResponse
+    │                                                   ↑ checks/writes diskcache first
+    ├── general_interactions → build_general_prompt() → llm.astream() → StreamingResponse
+    │
+    └── create/view/cancel/unsafe → graph.invoke()
+              │
+              ├── intent_router_node  (pass-through if intent already set)
+              ├── extract_reservation_node → merges fields across turns → tool_node
+              ├── tool_node           → create/view/cancel → SQLite ops
+              ├── general_node        (used only by /chat non-streaming)
+              ├── rag_node            (used only by /chat non-streaming)
+              └── reject_node         → "Access denied"
 ```
 
-Think of the system as a **switchboard**. Every message comes in, gets labelled with an intent, and gets routed to the right handler. The LangGraph graph is only used for reservation operations and unsafe queries — hotel questions and greetings bypass it entirely for speed.
+**Key insight:** `hotel_qa` and `general_interactions` bypass LangGraph entirely in the streaming path. This saves one full LLM call per request (the graph's `intent_router_node` would re-classify an intent we already know). Only reservation operations and unsafe queries go through the graph.
+
+---
+
+## 0. Repository Layout
+
+```
+grand-azure-bay-hotel-assistant/
+├── app/
+│   ├── api/server.py           # FastAPI app — all HTTP endpoints
+│   ├── cache/store.py          # diskcache wrapper, cache key normalisation
+│   ├── db/
+│   │   ├── database.py         # SQLite connection factory
+│   │   ├── models.py           # Alembic programmatic upgrade (create_tables)
+│   │   └── operations.py       # SQL CRUD functions — only file that touches DB
+│   ├── graph/
+│   │   ├── nodes.py            # All LangGraph node functions + shared helpers
+│   │   ├── router.py           # route_intent() — pure Python routing function
+│   │   ├── state.py            # AssistantState TypedDict definition
+│   │   └── workflow.py         # Graph wiring (StateGraph compile)
+│   ├── llm/
+│   │   ├── config.py           # OPENAI_MODEL constant
+│   │   └── provider.py         # FallbackLLM + CircuitBreaker
+│   ├── memory/store.py         # Redis-backed or in-memory conversation store
+│   ├── rag/
+│   │   ├── ingest.py           # PDF → sections → FAISS index (run once at build)
+│   │   ├── prompts.py          # All 3 prompts; LangSmith Hub pull at startup
+│   │   └── retriever.py        # FAISS load + retriever object
+│   ├── schemas/
+│   │   ├── api_schemas.py      # ChatRequest, ChatResponse, EscalationRequest
+│   │   ├── intent_schema.py    # IntentOutput, ReservationIDOutput
+│   │   └── reservation_schema.py # ReservationData (5 optional fields)
+│   ├── tools/reservation_tools.py  # create/view/cancel tool functions
+│   └── utils/
+│       ├── logger.py           # JSON logger + request_id ContextVar
+│       └── pii.py              # Email/phone scrubbing before LLM calls
+├── migrations/
+│   ├── env.py                  # Alembic env (offline + online modes)
+│   ├── script.py.mako          # Migration file template
+│   └── versions/
+│       └── e84fb6801694_initial_schema.py  # reservations + escalations tables
+├── frontend/app.py             # Streamlit UI — entire frontend in one file
+├── tests/
+│   ├── test_unit.py            # Pure unit tests (mock-free where possible)
+│   ├── test_stream.py          # Smoke tests against live /chat/stream endpoint
+│   ├── test_api.py             # Full API integration tests
+│   ├── test_intent_accuracy.py # Intent classification accuracy suite
+│   └── test_rag_quality.py     # RAGAS-based RAG quality evaluation
+├── scripts/push_prompts.py     # One-shot: push prompts to LangSmith Hub
+├── doc/hotel_rag_document_v2.pdf  # The hotel knowledge base (source of truth for RAG)
+├── faiss_index/                # Built by ingest.py at Docker build time
+├── .github/workflows/
+│   ├── sync-hf-spaces.yml      # master → prod HF Spaces (grand-azure-bay-api, grand-azure-bay)
+│   └── sync-hf-spaces-dev.yml  # dev → staging HF Spaces (grand-azure-bay-api-dev, grand-azure-bay-dev-staging)
+├── Dockerfile                  # Builds index at image build time, runs uvicorn on 7860
+├── docker-compose.yml          # Local dev: api on host:8000, frontend on host:8501
+├── alembic.ini                 # Alembic config (script_location = migrations)
+├── requirements.txt
+└── .env.example                # Template — copy to .env locally, use Space Secrets in HF
+```
 
 ---
 
@@ -28,426 +100,444 @@ Think of the system as a **switchboard**. Every message comes in, gets labelled 
 
 ### What Streamlit is
 
-Streamlit is a Python library that turns a Python script into a web app. Every time the user interacts (types, clicks a button), the **entire script reruns from top to bottom**. This is important — it means you cannot store state in regular variables. Everything that must survive a rerun lives in `st.session_state`.
+Streamlit turns a Python script into a web app. **Every user interaction reruns the entire script from top to bottom.** There are no callbacks or event handlers — Streamlit re-executes everything and React diffs the output. This means you cannot store mutable state in module-level variables. Everything that must survive a rerun lives in `st.session_state`.
 
-### Imports and API URL
+### API URL Resolution
 
 ```python
-import re
-import streamlit as st
-import requests
-import uuid
-import os
-import time
-from datetime import date, timedelta
-
 try:
     API_URL = st.secrets["API_URL"]
 except (FileNotFoundError, KeyError):
     API_URL = os.getenv("API_URL", "http://localhost:8000")
 ```
 
-- `st.secrets` is Streamlit's secure config — on Hugging Face Spaces this reads from the Space's secrets tab
-- Falls back to environment variable, then hardcoded localhost
-- This means the same frontend code works locally and in production without changes
+Priority order: `st.secrets` (HF Spaces secrets tab) → env var → hardcoded localhost. The same frontend code works in all three environments without modification.
 
-### Session State Initialisation
+**Alternative considered:** Hardcoding the backend URL. Rejected — would require separate frontend builds per environment.
+
+### Session State Keys
 
 ```python
-if "conversation_id" not in st.session_state:
-    st.session_state.conversation_id = str(uuid.uuid4())
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "pending_query" not in st.session_state:
-    st.session_state.pending_query = None
-if "show_booking_form" not in st.session_state:
-    st.session_state.show_booking_form = False
-if "cancel_res_ids" not in st.session_state:
-    st.session_state.cancel_res_ids = []
-if "user_email" not in st.session_state:
-    st.session_state.user_email = None
-if "escalate_query" not in st.session_state:
-    st.session_state.escalate_query = None
+st.session_state.conversation_id  # UUID — identifies this browser tab to the backend
+st.session_state.messages          # List of {role, content, reservation_id} dicts — drives chat display
+st.session_state.user_email        # Captured once at login; sent with every API request
+st.session_state.pending_query     # Sidebar button clicks queue here; consumed by main loop
+st.session_state.show_booking_form # Boolean — controls whether booking form renders
+st.session_state.cancel_res_ids    # List of IDs for which cancel buttons render
+st.session_state.escalate_query    # The unanswered query; shows "Ask a Human" button
 ```
 
-Each `if` guard runs on every page load. The `not in` check means it only initialises once — subsequent reruns skip it because the key already exists.
+Each `if key not in st.session_state:` guard runs every rerun but only initialises on first load.
 
-| Key | Purpose |
-|---|---|
-| `conversation_id` | A UUID that identifies this browser session to the backend |
-| `messages` | Full chat history displayed on screen |
-| `pending_query` | Sidebar button clicks store their query here; the main loop picks it up |
-| `show_booking_form` | Whether to render the booking form below the chat |
-| `cancel_res_ids` | List of reservation IDs to show cancel buttons for |
-| `user_email` | Captured once at start, sent with every API request |
-| `escalate_query` | The unanswered query to escalate to a human |
-
-### Email Capture (Welcome Screen)
+### Email Gate (`st.stop()`)
 
 ```python
 if not st.session_state.user_email:
-    with st.chat_message("assistant", avatar="🏨"):
-        st.markdown("Welcome to **Grand Azure Bay Hotel**! ...")
-    with st.form("email_form", clear_on_submit=True):
-        col1, col2 = st.columns([4, 1])
-        with col1:
-            email_input = st.text_input("Your email address", ...)
-        with col2:
-            email_submitted = st.form_submit_button("Continue", type="primary")
-    if email_submitted:
-        if "@" in email_input and "." in email_input:
-            st.session_state.user_email = email_input.strip()
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": "Welcome! How can I assist you today?...",
-            })
-            st.rerun()
-        else:
-            st.error("Please enter a valid email address.")
-    st.stop()   # ← nothing below this runs until email is provided
+    # render email form
+    st.stop()   # ← halts script execution here; nothing below runs
 ```
 
-`st.stop()` is key — it halts the script at that point so the chat interface never renders until email is provided. `st.rerun()` after a valid email forces the script to restart, this time with `user_email` set, so `st.stop()` is not hit and the chat loads.
+`st.stop()` is the gate. Until the user provides an email, the chat interface never renders. After valid email is submitted, `st.rerun()` restarts the script, this time clearing the gate. The welcome message is injected directly into `st.session_state.messages` (no API call) so it appears instantly.
 
-No API call is made here — the welcome message is injected directly into `st.session_state.messages` as a local client-side message.
+**Why capture email at the start?** The backend uses it as the default email for all reservation operations. Without it, the bot would have to ask for email every time a user wants to view or cancel a booking.
 
 ### The `send()` Function
 
-This is the core of the frontend. It runs when the user submits a message.
+The core function. Runs when the user submits a message.
 
 ```python
 def send(query: str):
-    # 1. Add user message to local chat history and display it
+    # 1. Append user message to local history + display it immediately
     st.session_state.messages.append({"role": "user", "content": query})
-    with st.chat_message("user", avatar="🧑"):
-        st.markdown(query)
 
-    # 2. Show thinking indicator while waiting
-    with st.chat_message("assistant", avatar="🏨"):
-        placeholder = st.empty()
-        placeholder.markdown('<span class="blink-cursor">▋</span> *Thinking...*',
-                             unsafe_allow_html=True)
-        t_start = time.time()
+    # 2. Show blinking cursor while waiting
+    placeholder = st.empty()
+    placeholder.markdown('<span class="blink-cursor">▋</span> *Thinking...*', ...)
+
+    # 3. POST to /chat/stream with stream=True
+    with requests.post(f"{API_URL}/chat/stream",
+        json={"conversation_id": ..., "query": query, "user_email": ...},
+        stream=True, timeout=60) as res:
+
+        placeholder.empty()   # remove cursor
+
+        def token_generator():
+            for chunk in res.iter_content(chunk_size=None):
+                if chunk:
+                    yield chunk.decode("utf-8")
+
+        reply = st.write_stream(token_generator())
+        # st.write_stream() prints each yielded token to the screen as it arrives
 ```
 
-`st.empty()` creates a placeholder that can be replaced. We put the blinking cursor there, then replace it with the streamed response when it arrives.
+`requests.post(stream=True)` keeps the HTTP connection open. `res.iter_content()` reads each chunk as the server sends it. `st.write_stream()` renders them progressively — this is the typewriter effect.
+
+After streaming, `reply` holds the full concatenated response text. It's parsed for a reservation ID using `re.search(r"Reservation ID[:\s#]+(\d+)", reply)` because the streaming endpoint returns plain text (not JSON), so the ID must be extracted from prose.
+
+### Booking Form Trigger
 
 ```python
-        try:
-            with requests.post(
-                f"{API_URL}/chat/stream",
-                json={
-                    "conversation_id": st.session_state.conversation_id,
-                    "query": query,
-                    "user_email": st.session_state.user_email,
-                },
-                stream=True,
-                timeout=60,
-            ) as res:
+_BOOKING_TRIGGERS = ["full name", "check-in date", "check-out date", "email address"]
+
+def _is_booking_ask(text: str) -> bool:
+    lower = text.lower()
+    return sum(1 for p in _BOOKING_TRIGGERS if p in lower) >= 1  # ← threshold = 1
 ```
 
-`stream=True` tells the `requests` library not to download the full response at once — it keeps the connection open and reads chunks as they arrive. This is what enables the typewriter effect.
+When the bot response contains any booking-related phrase, `show_booking_form` becomes `True`. On the next Streamlit rerun, the form renders.
 
-```python
-                placeholder.empty()   # remove thinking cursor
-
-                def token_generator():
-                    for chunk in res.iter_content(chunk_size=None):
-                        if chunk:
-                            yield chunk.decode("utf-8")
-
-                reply = st.write_stream(token_generator())
-```
-
-`st.write_stream()` is a Streamlit function that accepts a generator and prints each yielded value to the screen as it arrives. `token_generator()` is that generator — it reads chunks from the HTTP response and yields them one by one.
-
-```python
-                elapsed = time.time() - t_start
-                st.markdown(f'<span class="latency-pill">⚡ {elapsed:.1f}s</span>',
-                            unsafe_allow_html=True)
-
-                _rid_match = re.search(r"Reservation ID[:\s#]+(\d+)", reply or "")
-                rid = int(_rid_match.group(1)) if _rid_match else None
-```
-
-After streaming completes, `reply` holds the full text. We use regex to extract the reservation ID from the text (e.g. "Reservation ID: 61") and show it as a green pill badge. This was added because the streaming endpoint returns plain text, not JSON — so we parse the ID from the prose.
-
-### Post-send State Updates
-
-```python
-    # Booking form: appears when bot asks for name/dates
-    st.session_state.show_booking_form = _is_booking_ask(reply)
-
-    # Cancel buttons: only when user explicitly said "cancel"
-    if _is_cancel_query(query) and "reservation" in reply.lower():
-        st.session_state.cancel_res_ids = re.findall(r"#(\d+)", reply)
-    else:
-        st.session_state.cancel_res_ids = []
-
-    # Escalation button: when bot couldn't answer
-    reply_lower = (reply or "").lower()
-    if any(t in reply_lower for t in _ESCALATION_TRIGGERS):
-        st.session_state.escalate_query = query
-    else:
-        st.session_state.escalate_query = None
-```
-
-These flags control what appears below the chat after a response. Since Streamlit reruns the whole script after `send()` returns, these session state values persist and the corresponding UI blocks render on the next cycle.
+**Why threshold=1?** The bot asks for one or two fields at a time conversationally (e.g. "Could you share your full name?"). It never asks for all four fields in a single message. An earlier threshold of `>= 2` meant the form never appeared. Fixed to `>= 1`.
 
 ### Booking Form
 
 ```python
 if st.session_state.show_booking_form:
     with st.form("booking_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
-        with col1:
-            name = st.text_input("Full Name *")
-            room_type = st.selectbox("Room Type", ["Standard", "Deluxe", "Suite"])
-        with col2:
-            today = date.today()
-            check_in = st.date_input("Check-in Date", value=today + timedelta(days=1),
-                                     min_value=today)
-            check_out = st.date_input("Check-out Date", value=today + timedelta(days=2),
-                                      min_value=today)
+        name = st.text_input("Full Name *")
+        room_type = st.selectbox("Room Type", ["Standard", "Deluxe", "Suite"])
+        check_in = st.date_input("Check-in Date", value=today + timedelta(days=1))
+        check_out = st.date_input("Check-out Date", value=today + timedelta(days=2))
         submitted = st.form_submit_button("Confirm Booking", type="primary")
+        cancelled = st.form_submit_button("Never mind")
 ```
 
-`st.form` groups inputs so they only trigger a rerun on submit, not on every keystroke. `clear_on_submit=True` resets the fields after submission.
+`st.form` batches inputs — no rerun happens until submit is clicked. Email is intentionally absent: `st.session_state.user_email` is used automatically.
 
-The email field is intentionally absent — `st.session_state.user_email` is used automatically:
-
+On submit, the form constructs a structured natural language query:
 ```python
-    if submitted:
-        # validation
-        st.session_state.pending_query = (
-            f"Book a room for {name.strip()}, email {st.session_state.user_email}, "
-            f"room type {room_type}, check-in {check_in}, check-out {check_out}"
-        )
-        st.rerun()
+st.session_state.pending_query = (
+    f"Book a room for {name}, email {st.session_state.user_email}, "
+    f"room type {room_type}, check-in {check_in}, check-out {check_out}"
+)
+st.rerun()
 ```
 
-The form constructs a well-formatted natural language query with exact ISO dates (`2026-05-19`) and puts it in `pending_query`. On `st.rerun()`, the script hits:
+The explicit ISO dates (`2026-05-21`) in this string ensure the extraction LLM never has to guess dates. Unambiguous input = reliable extraction.
 
+**Chat input hidden during booking form:**
 ```python
-if st.session_state.pending_query:
-    q = st.session_state.pending_query
-    st.session_state.pending_query = None
-    send(q)
+_chat_locked = st.session_state.show_booking_form or bool(st.session_state.cancel_res_ids)
+if not _chat_locked:
+    if user_input := st.chat_input("Ask about the hotel or manage your reservation…"):
+        send(user_input)
 ```
 
-This picks up the pending query and calls `send()` — which sends it to the API. The API then extracts the fields from this clean structured sentence, which works reliably because the dates are already formatted.
+The chat input is **not rendered at all** (not just disabled) when the booking form is active. `disabled=True` still shows a greyed-out box; omitting the render removes it entirely.
 
 ---
 
 ## 2. API Server — `app/api/server.py`
 
-### FastAPI Basics
-
-FastAPI is a Python web framework. You define endpoints with decorators (`@app.post`, `@app.get`). It automatically validates request/response bodies using Pydantic schemas and generates OpenAPI docs at `/docs`.
-
-### Module-Level Initialisation
+### Startup
 
 ```python
 app = FastAPI()
-create_tables()   # create DB tables if they don't exist
+create_tables()   # runs Alembic upgrade to "head" — idempotent, safe to call every startup
 ```
 
-`create_tables()` runs once when the server starts. It creates the `reservations` and `escalations` tables in SQLite if they don't already exist (the `CREATE TABLE IF NOT EXISTS` pattern).
+`create_tables()` calls `alembic.command.upgrade(cfg, "head")` programmatically. If the DB is already at the latest migration, it's a no-op.
 
-### Latency Middleware
+### Middleware Stack
+
+Middleware is applied in reverse registration order (last registered = outermost wrapper):
 
 ```python
+app.add_middleware(LatencyMiddleware)    # registered first → runs second (inner)
+app.add_middleware(RequestIdMiddleware)  # registered second → runs first (outer)
+```
+
+**RequestIdMiddleware:**
+```python
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        rid = str(uuid.uuid4())
+        token = request_id_var.set(rid)      # inject into ContextVar
+        try:
+            response = await call_next(request)
+            response.headers["X-Request-Id"] = rid   # echo back to client
+            return response
+        finally:
+            request_id_var.reset(token)      # clean up after request completes
+```
+
+`request_id_var` is a `contextvars.ContextVar` from `app/utils/logger.py`. Every log line emitted during this request reads the ContextVar and includes `request_id`. This lets you grep all logs for a single request across the entire handler chain.
+
+**Alternative considered:** Thread-local storage. Rejected — the server is async (uvicorn + asyncio); threads don't map to requests. `contextvars` is the correct async-safe mechanism.
+
+**LatencyMiddleware:**
+```python
 class LatencyMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
+    async def dispatch(self, request, call_next):
         start = time.perf_counter()
         response = await call_next(request)
         latency_ms = round((time.perf_counter() - start) * 1000, 2)
-        logger.info("http_request", extra={
-            "path": request.url.path,
-            "latency_ms": latency_ms,
-        })
+        logger.info("http_request", extra={"path": ..., "latency_ms": latency_ms})
         return response
-
-app.add_middleware(LatencyMiddleware)
 ```
 
-Middleware wraps every request. `call_next` runs the actual endpoint handler. We measure time before and after, then log it. This gives us latency for every endpoint automatically — we don't have to add timing code to each handler.
+`time.perf_counter()` is used over `time.time()` because `perf_counter` has nanosecond resolution and is monotonic (unaffected by system clock adjustments).
 
-### Memory Store
-
-```python
-# app/memory/store.py
-conversation_memory = {}
-```
-
-The simplest possible session store — a Python dict. Keys are `conversation_id` strings (UUIDs from the frontend). Values are dicts containing:
-
-```python
-{
-    "chat_history": [
-        {"role": "user",      "content": "What time is check-in?"},
-        {"role": "assistant", "content": "Check-in is at 2:00 PM."},
-        # ... trimmed to last 6 messages (_HISTORY_WINDOW = 6)
-    ],
-    "current_reservation": None,   # partial booking data during multi-turn
-    "user_email": "guest@example.com",
-    "pending_cancel": None,        # set when awaiting cancel confirmation
-}
-```
-
-Both the user's message and the assistant's reply are stored in `chat_history` after every turn. The helper `_append_assistant_reply(memory, text)` appends the assistant message and then trims the list to the last 6 entries (3 full exchanges) so prompt tokens stay bounded regardless of how long the conversation runs. This is called from every exit path in both `/chat` and `/chat/stream`.
-
-This is in-memory, so it resets on server restart. For production, this would be Redis.
+### Memory Initialisation
 
 ```python
 def _get_or_init_memory(conversation_id: str) -> dict:
-    if conversation_id not in conversation_memory:
-        conversation_memory[conversation_id] = {
+    mem = conversation_memory.get(conversation_id)
+    if mem is None:
+        mem = {
             "chat_history": [],
+            "history_summary": "",   # compact text of overflowed messages
             "current_reservation": None,
+            "pending_cancel": None,
         }
-    return conversation_memory[conversation_id]
+        conversation_memory.save(conversation_id, mem)
+    return mem
 ```
 
-Called at the start of every request. Creates a new session for new conversations, returns the existing one for returning ones.
+`conversation_memory` is the store from `app/memory/store.py` — either Redis or in-memory. Always call `.get()` (returns None on miss) then `.save()` after mutations. Never use `conversation_memory[cid] =` directly — Redis requires an explicit serialisation step that `.save()` handles.
 
-### The `/chat/stream` Endpoint — Step by Step
-
-```python
-@app.post("/chat/stream")
-async def chat_stream(payload: ChatRequest):
-    query = payload.query
-    conversation_id = payload.conversation_id
-    memory = _get_or_init_memory(conversation_id)
-    memory["chat_history"].append({"role": "user", "content": query})
-```
-
-**Step 1:** Store the user's message in memory. After the response is generated, `_append_assistant_reply()` appends the assistant's reply and trims the list to `_HISTORY_WINDOW = 6` messages (3 full exchanges). Both sides of the conversation are stored so the intent classifier and extraction prompt have full context — the bot can reference its own previous answers.
+### History Windowing + Summarisation
 
 ```python
-    if payload.user_email and not memory.get("user_email"):
-        memory["user_email"] = payload.user_email
+_HISTORY_WINDOW = 6   # 3 full turn-pairs (user + assistant each)
 
-    current_reservation = memory.get("current_reservation") or {}
-    if memory.get("user_email") and not current_reservation.get("email"):
-        current_reservation = {**current_reservation, "email": memory["user_email"]}
-```
-
-**Step 2:** Persist the user's email into memory on the first request that includes it. Then inject it into `current_reservation` context so the graph nodes always have the email available — they use `current_reservation.get("email")` as the fallback when the user doesn't explicitly state their email in the current message.
-
-```python
-    intent_prompt = INTENT_PROMPT.format(
-        chat_history=memory["chat_history"], query=query
-    )
-    intent_result = llm.with_structured_output(IntentOutput).invoke(intent_prompt)
-    intent = intent_result.intent
-```
-
-**Step 3:** Classify the intent. `with_structured_output(IntentOutput)` tells the LLM to return a JSON object that matches the `IntentOutput` Pydantic schema `{"intent": "hotel_qa"}`. This guarantees we always get a valid intent string, never a freeform sentence.
-
-```python
-    if intent == "hotel_qa":
-        cache_key = make_cache_key(query)
-        if cache_key in _rag_cache:
-            async def cached_stream():
-                yield cached["response"]
-            return StreamingResponse(cached_stream(), media_type="text/plain")
-```
-
-**Step 4a (hotel_qa):** Check the cache first. `make_cache_key()` normalises the query (lowercase, strip punctuation) so "What's check-in?" and "what is check in time" produce the same key. If cached, return immediately — no LLM call needed.
-
-```python
-        docs = retriever.invoke(query)
-        context = "\n\n".join(doc.page_content for doc in docs)
-        rag_prompt = RAG_PROMPT.format(context=context, question=query)
-
-        async def generate():
-            full_response = []
-            async for chunk in llm.astream(rag_prompt):
-                if chunk.content:
-                    full_response.append(chunk.content)
-                    yield chunk.content
-            response_text = "".join(full_response)
-            if is_cacheable(response_text):
-                _rag_cache.set(cache_key, {"response": response_text}, expire=86400)
-
-        return StreamingResponse(generate(), media_type="text/plain")
-```
-
-**Step 4b (hotel_qa, cache miss):** Retrieve context from FAISS, build the RAG prompt, and stream the LLM response token by token. As each token arrives, it's yielded to `StreamingResponse` which sends it to the frontend immediately. Only cache if `is_cacheable()` passes — i.e. the response is not a fallback "I don't know" message.
-
-`StreamingResponse` with `media_type="text/plain"` keeps the HTTP connection open and flushes data as it's produced. The frontend's `requests.post(..., stream=True)` + `res.iter_content()` reads these chunks.
-
-```python
-    elif intent == "general_interactions":
-        gen_prompt = (
-            f"You are a friendly hotel concierge..."
-            f"Chat history: {chat_history}\nGuest: {query}\nAssistant:"
+def _append_assistant_reply(conversation_id: str, memory: dict, text: str) -> None:
+    memory["chat_history"].append({"role": "assistant", "content": text})
+    if len(memory["chat_history"]) > _HISTORY_WINDOW:
+        overflow = memory["chat_history"][:-_HISTORY_WINDOW]
+        compact = " | ".join(
+            f"{'Guest' if m['role'] == 'user' else 'Bot'}: {m['content'][:120]}"
+            for m in overflow
         )
-        async def gen_stream():
-            async for chunk in llm.astream(gen_prompt):
-                if chunk.content:
-                    yield chunk.content
-        return StreamingResponse(gen_stream(), media_type="text/plain")
+        existing = memory.get("history_summary", "")
+        memory["history_summary"] = f"{existing} | {compact}".strip(" |") if existing else compact
+        memory["chat_history"] = memory["chat_history"][-_HISTORY_WINDOW:]
+    conversation_memory.save(conversation_id, memory)
 ```
 
-**Step 4c (general):** Greetings, thanks, small talk — handled inline without invoking LangGraph. This avoids a second LLM call (the graph would call `general_node` which calls `llm.invoke()` again). One LLM call total instead of two.
+Old messages are not silently dropped. They're compressed into `history_summary` — a pipe-delimited string of 120-char excerpts. This string is prepended to the intent prompt as a system message so the LLM has long-term context even after many turns. **This function is the single save point** — every code path calls it last.
+
+**Alternative considered:** Summarising with an LLM call. Rejected — adds latency and cost. Simple truncation to 120 chars per message is good enough for intent context.
+
+### Cancellation Confirmation Short-Circuit
+
+Before calling any LLM or graph, the server checks:
 
 ```python
-    else:
-        response = graph.invoke({
-            "query": query,
-            "intent": intent,
-            "response": None,
-            "reservation_data": None,
-            "reservation_id": None,
-            "current_reservation": current_reservation,
-            "chat_history": memory["chat_history"],
-        })
-
-        if response.get("reservation_id"):
-            memory["current_reservation"] = None   # booking complete, reset
-        elif response.get("reservation_data"):
-            memory["current_reservation"] = response["reservation_data"]  # partial, accumulate
+pending = memory.get("pending_cancel")
+if pending:
+    if _is_confirmation(query):    # "yes", "confirm", "ok", "go ahead", etc.
+        result = cancel_reservation_tool(pending["reservation_id"], pending["email"])
+        memory["pending_cancel"] = None
+        # stream result back
+    elif _is_denial(query):        # "no", "never mind", "stop", etc.
+        memory["pending_cancel"] = None
+        # stream "your reservation is still active"
 ```
 
-**Step 4d (reservation/unsafe):** Invoke the LangGraph graph with the full state. We pass the already-classified intent so the `intent_router_node` inside the graph skips its own classification (no double LLM call).
+This intercepts the yes/no confirmation step **without an LLM call**. The sets `_CONFIRM` and `_DENY` cover the full vocabulary of affirmation and negation. If the query matches neither (e.g. a completely different question), the intercept is skipped and normal intent classification proceeds.
 
-After the graph returns, we update `current_reservation`. If a booking was completed (`reservation_id` returned), we reset it to `None` so the next "book a room" starts fresh. If the graph returned partial data (user provided some fields but not all), we store it for the next turn.
+### Intent Classification
+
+```python
+summary = memory.get("history_summary", "")
+history_for_prompt = (
+    [{"role": "system", "content": f"Earlier conversation summary: {summary}"}]
+    + memory["chat_history"]
+    if summary else memory["chat_history"]
+)
+intent_result = llm.with_structured_output(IntentOutput).invoke(
+    INTENT_PROMPT.format(chat_history=history_for_prompt, query=query)
+)
+intent = intent_result.intent
+```
+
+`with_structured_output(IntentOutput)` forces the LLM to return `{"intent": "<one of 6 values>"}`. This uses OpenAI's response_format / function-calling API under the hood. The model physically cannot return a freeform string — Pydantic validates the JSON and raises if the value isn't one of the 6 known intents.
+
+### Routing After Classification
+
+```python
+if intent == "hotel_qa":
+    # RAG path — streaming, no graph
+elif intent == "general_interactions":
+    # inline prompt — streaming, no graph
+else:
+    response = graph.invoke({...})   # reservation/unsafe → graph
+```
+
+`hotel_qa` and `general_interactions` use shared helper functions from `nodes.py` (`check_rag_cache`, `build_rag_prompt`, `build_general_prompt`) rather than duplicating logic. The graph path uses `graph.invoke()` which is synchronous — it runs its nodes and returns the final state dict.
+
+### Drift Logging
+
+```python
+_DRIFT_LOG = Path(".metrics/intent_log.jsonl")
+
+def _log_drift(intent: str, query_len: int) -> None:
+    entry = json.dumps({"ts": time.time(), "intent": intent, "query_len": query_len})
+    with open(_DRIFT_LOG, "a") as f:
+        f.write(entry + "\n")
+```
+
+Every classified intent is appended to a JSONL file. The `/metrics/drift` endpoint reads this file, splits it into two windows (recent N vs previous N), and computes intent distribution. If any intent shifts by >10 percentage points between windows, it raises a `drift_alerts` list. This catches things like "hotel_qa dropping from 60% to 20%" which might indicate users started asking questions the bot can't answer.
 
 ---
 
-## 3. LangGraph — The State Machine
+## 3. Conversation Memory — `app/memory/store.py`
+
+Two implementations behind the same interface:
+
+```python
+class _InMemoryStore:
+    """Dict-backed. Fast, zero dependencies. Resets on server restart."""
+    def get(self, cid: str) -> dict | None
+    def save(self, cid: str, data: dict) -> None
+
+class _RedisStore:
+    """Redis-backed. Survives restarts. TTL-based eviction.
+    Key format: hotel:conv:<conversation_id>
+    Value: JSON-serialised dict
+    TTL: refreshed on every write (active sessions never expire mid-flow)"""
+    def get(self, cid: str) -> dict | None
+    def save(self, cid: str, data: dict) -> None
+```
+
+Startup auto-detection:
+```python
+def _build_store():
+    url = os.getenv("REDIS_URL")
+    if url and _has_redis:
+        try:
+            store = _RedisStore(url)
+            store._r.ping()    # connection test
+            return store
+        except Exception as exc:
+            logger.warning("Redis unavailable (%s) — falling back to in-memory", exc)
+    return _InMemoryStore()
+
+conversation_memory = _build_store()   # module-level singleton
+```
+
+**Why explicit `.save()` instead of returning a mutable dict?**
+With Redis, `get()` deserialises JSON into a new dict object. Mutations to that dict don't automatically propagate back to Redis. You must explicitly call `save()`. With in-memory, mutations to the returned reference would auto-update, but we use the same `.save()` pattern for consistency. Every mutation path ends with `conversation_memory.save()`.
+
+**TTL:** `CONV_TTL_SECONDS` env var (default 86400 = 24 hours). Refreshed on every write. A conversation that goes 24 hours without activity is automatically evicted.
+
+**Alternative considered:** PostgreSQL session store. Rejected — adds infrastructure complexity. Redis is purpose-built for this pattern.
+
+---
+
+## 4. LLM Provider — `app/llm/provider.py`
+
+### FallbackLLM
+
+```python
+class FallbackLLM:
+    def __init__(self):
+        self.primary_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, max_tokens=1024)
+        self.fallback_llm = ChatGroq(model="llama-3.1-8b-instant", ...) if GROQ_API_KEY else None
+```
+
+- `temperature=0` — deterministic output. The model always picks the highest-probability token. Critical for structured extraction (same input = same output) and intent classification (no random variation).
+- `max_tokens=1024` — prevents runaway responses. Without this cap, `with_structured_output()` calls were hitting the model's 16K context limit when the extraction prompt went wrong, causing `LengthFinishReasonError`.
+
+### Circuit Breaker
+
+```python
+_FAILURE_THRESHOLD = 3    # open circuit after 3 consecutive OpenAI failures
+_RECOVERY_TIMEOUT = 30    # wait 30 seconds before probing OpenAI again (HALF_OPEN)
+
+class _CircuitBreaker:
+    """Three-state: CLOSED → OPEN → HALF_OPEN → CLOSED"""
+    def is_open(self) -> bool: ...       # OPEN → HALF_OPEN after timeout
+    def record_success(self): ...        # resets to CLOSED, clears failures
+    def record_failure(self): ...        # increments; opens circuit at threshold
+```
+
+States:
+- **CLOSED** — normal. All calls go to OpenAI.
+- **OPEN** — OpenAI is broken. Skip it, go straight to Groq. Check time.
+- **HALF_OPEN** — timeout expired. Try OpenAI once. Success → CLOSED. Failure → OPEN again.
+
+Without a circuit breaker, every request during an OpenAI outage would wait for a timeout before failing over to Groq, adding 10–30 seconds of latency per request.
+
+**Alternative considered:** `tenacity` retry library. Rejected — retries add latency for the calling user. Circuit breaker fails fast and routes to a working fallback immediately.
+
+### Fallback Patterns
+
+```python
+# Synchronous invoke — used for intent classification, extraction, structured output
+def invoke(self, prompt):
+    if _circuit.is_open:
+        return self._use_fallback(prompt)    # immediate Groq call
+    try:
+        result = self.primary_llm.invoke(prompt)
+        _circuit.record_success()
+        return result
+    except Exception:
+        _circuit.record_failure()
+        return self._use_fallback(prompt)   # Groq call after OpenAI failure
+
+# Async streaming — used for RAG and general responses
+async def astream(self, prompt):
+    if _circuit.is_open:
+        async for chunk in self._astream_fallback(prompt):
+            yield chunk
+        return
+    try:
+        async for chunk in self.primary_llm.astream(prompt):
+            yield chunk
+        _circuit.record_success()
+    except Exception:
+        _circuit.record_failure()
+        async for chunk in self._astream_fallback(prompt):
+            yield chunk
+```
+
+Fallback on `astream` still streams token by token from Groq — the user experience degrades to a slower model but retains the typewriter effect.
+
+### Structured Output Fallback
+
+```python
+def with_structured_output(self, schema):
+    return _FallbackStructuredOutput(
+        primary=self.primary_llm.with_structured_output(schema),
+        fallback=self.fallback_llm.with_structured_output(schema) if self.fallback_llm else None,
+    )
+```
+
+`_FallbackStructuredOutput.invoke()` tries OpenAI first; on exception, tries Groq. Both support structured output via their respective function-calling APIs.
+
+---
+
+## 5. LangGraph — `app/graph/`
 
 ### What LangGraph Is
 
-LangGraph is a library for building stateful, multi-step LLM workflows as a directed graph. Think of it like a flowchart where:
-- **Nodes** are functions that transform state
-- **Edges** define which node runs next
-- **State** is a typed dict that flows through the graph and gets updated by each node
+LangGraph is a library for stateful multi-step LLM workflows. Think of it as a flowchart where:
+- **Nodes** are Python functions that receive state and return partial state updates
+- **Edges** define which node runs next (static) or a function that decides (conditional)
+- **State** is a `TypedDict` that flows through the graph, merged at each step
 
-### The State — `app/graph/state.py`
+### State — `app/graph/state.py`
 
 ```python
 class AssistantState(TypedDict):
-    query: str                          # the user's current message
-    intent: Optional[str]               # classified intent
-    response: Optional[str]             # the final answer to send back
-    reservation_data: Optional[dict]    # extracted booking fields
-    chat_history: Optional[list]        # conversation history
-    current_reservation: Optional[dict] # partial booking or last booking's context
-    reservation_id: Optional[int]       # ID of a newly created reservation
-    reservation_list: Optional[list]    # list of reservations (for display)
+    query: str                          # current user message
+    intent: Optional[str]               # classified intent (6 values)
+    response: Optional[str]             # final answer text
+    reservation_data: Optional[dict]    # extracted booking fields (accumulates across turns)
+    chat_history: Optional[list]        # last 6 messages
+    current_reservation: Optional[dict] # partial booking or email context
+    reservation_id: Optional[int]       # ID of newly created reservation
+    reservation_list: Optional[list]    # list of reservations for display
     pending_cancel: Optional[dict]      # {"reservation_id": int, "email": str}
 ```
 
-`TypedDict` is a Python type hint that says "this dict must have these keys with these types". LangGraph uses it to validate state at each step. Nodes return a **partial state** — only the keys they want to update — and LangGraph merges it with the existing state.
+Nodes return **partial dicts** — only the keys they want to update. LangGraph merges the partial dict with existing state. Keys not returned by a node are unchanged.
 
-### The Workflow — `app/graph/workflow.py`
+### Workflow — `app/graph/workflow.py`
 
 ```python
 builder = StateGraph(AssistantState)
-
 builder.add_node("intent_router", intent_router_node)
 builder.add_node("rag_node", rag_node)
 builder.add_node("tool_node", tool_node)
@@ -456,229 +546,207 @@ builder.add_node("reject_node", reject_node)
 builder.add_node("extract_reservation", extract_reservation_node)
 
 builder.set_entry_point("intent_router")
-builder.add_conditional_edges("intent_router", route_intent)
-
-builder.add_edge("extract_reservation", "tool_node")
-builder.add_edge("general_node", END)
-builder.add_edge("rag_node", END)
-builder.add_edge("tool_node", END)
-builder.add_edge("reject_node", END)
-
-graph = builder.compile()
+builder.add_conditional_edges("intent_router", route_intent)  # function decides next node
+builder.add_edge("extract_reservation", "tool_node")          # always → tool_node
+# all other nodes → END
 ```
 
-The graph always enters at `intent_router`. From there, `route_intent` decides where to go. Every path eventually leads to `END`. The only multi-hop path is `extract_reservation → tool_node` for booking (first extract fields, then execute the booking).
+**Important note in the code:** `rag_node` and `general_node` are only exercised by the non-streaming `/chat` endpoint (used in tests and direct API calls). The streaming `/chat/stream` endpoint bypasses the graph for these intents. This means in production (all traffic goes through `/chat/stream`), `rag_node` and `general_node` are never called via the graph.
 
-### The Router — `app/graph/router.py`
+### Router — `app/graph/router.py`
 
 ```python
 def route_intent(state: AssistantState):
     intent = state["intent"]
-    if intent == "hotel_qa":
-        return "rag_node"
-    elif intent == "create_reservation":
-        return "extract_reservation"
-    elif intent in ["view_reservation", "cancel_reservation"]:
-        return "tool_node"
-    elif intent == "general_interactions":
-        return "general_node"
-    else:
-        return "reject_node"   # unsafe or unknown
+    if intent == "hotel_qa":           return "rag_node"
+    elif intent == "create_reservation": return "extract_reservation"
+    elif intent in ["view_reservation", "cancel_reservation"]: return "tool_node"
+    elif intent == "general_interactions": return "general_node"
+    else:                              return "reject_node"
 ```
 
-This is a pure Python function — no LLM involved. It reads the `intent` field from state and returns the name of the next node as a string. LangGraph calls this after `intent_router` runs.
-
----
-
-## 4. Nodes — `app/graph/nodes.py`
+Pure Python. No LLM. Reads the `intent` field and returns the next node name as a string.
 
 ### `intent_router_node`
 
 ```python
 def intent_router_node(state: AssistantState):
     if state.get("intent"):
-        return {}   # already classified by server.py, skip
-    query = state["query"]
-    chat_history = state.get("chat_history", [])
-    prompt = INTENT_PROMPT.format(chat_history=chat_history, query=query)
-    structured_llm = llm.with_structured_output(IntentOutput)
-    result = structured_llm.invoke(prompt)
+        return {}    # already classified by server.py — pass through, no LLM call
+    # else classify (used only by /chat non-streaming endpoint)
+    result = llm.with_structured_output(IntentOutput).invoke(intent_prompt)
     return {"intent": result.intent}
 ```
 
-The `if state.get("intent"): return {}` guard is critical. The `/chat/stream` endpoint classifies intent before calling `graph.invoke()` and passes it in the state. Without this guard, the graph would classify intent again — two LLM calls for the same thing. Returning `{}` means "update nothing in the state, just pass through".
-
-### `rag_node`
-
-```python
-def rag_node(state: AssistantState):
-    query = state["query"]
-    cache_key = make_cache_key(query)
-
-    if cache_key in _rag_cache:
-        cached = _rag_cache[cache_key]
-        return {"response": cached["response"]}
-
-    docs = retriever.invoke(query)
-    context = "\n\n".join(doc.page_content for doc in docs)
-    prompt = RAG_PROMPT.format(context=context, question=query)
-    response = llm.invoke(prompt)
-
-    if is_cacheable(response.content):
-        _rag_cache.set(cache_key, {"response": response.content}, expire=86400)
-
-    return {"response": response.content}
-```
-
-Used by the `/chat` (non-streaming) endpoint. Same logic as the streaming path but synchronous. The cache is shared between both paths — a cache hit in `/chat` will also be a hit in `/chat/stream` for the same query.
+The `return {}` guard prevents double classification. The streaming endpoint classifies intent before calling `graph.invoke()` and passes it in state. This node checks for it and skips if present.
 
 ### `extract_reservation_node`
 
 ```python
 def extract_reservation_node(state: AssistantState):
-    query = state["query"]
-    chat_history = state.get("chat_history", [])
-
-    prompt = EXTRACTION_PROMPT.format(chat_history=chat_history, query=query)
-    structured_llm = llm.with_structured_output(ReservationData)
-    extracted_data = structured_llm.invoke(prompt)
-
     existing_reservation = state.get("current_reservation")
-    new_data = extracted_data.model_dump()   # Pydantic → dict
+    chat_history = state.get("chat_history", []) if existing_reservation else []
+    # Only use chat history mid-booking. Fresh bookings use current message only
+    # (prevents stale values from a previous completed booking leaking in)
+
+    extracted_data = llm.with_structured_output(ReservationData).invoke(
+        EXTRACTION_PROMPT.format(today=today, chat_history=chat_history, query=query)
+    )
+    new_data = extracted_data.model_dump()
 
     if existing_reservation:
-        merged_data = {
-            **existing_reservation,
-            **{k: v for k, v in new_data.items() if v is not None}
-        }
+        # Merge: keep old values, overwrite with new non-null values
+        merged_data = {**existing_reservation, **{k: v for k, v in new_data.items() if v is not None}}
     else:
         merged_data = new_data
 
     return {"reservation_data": merged_data}
 ```
 
-This is the multi-turn booking brain. `ReservationData` has 5 optional fields. The LLM extracts whatever the user has provided so far and returns a partial object (nulls for missing fields).
+This is the multi-turn booking brain. `ReservationData` has 5 optional fields. The LLM extracts whatever the user provided in the current message (nulls for everything else). The merge logic accumulates fields across turns. Turn 1: `{name: "Kulo", ...nulls}`. Turn 2 (after form submission): `{name: "Kulo", room_type: "Deluxe", check_in: "2026-05-21", check_out: "2026-05-22", email: "k@x.com"}`.
 
-The merge logic: `{**existing_reservation, **{k: v for k, v in new_data.items() if v is not None}}` — start with what we already know, then overwrite with any newly provided non-null values. This means over multiple turns, the dict fills up field by field.
-
-### `tool_node` — View Reservation Path
+### `tool_node` — create_reservation path
 
 ```python
-elif intent == "view_reservation":
-    lookup = _extract_lookup_info(query, chat_history)
-    email = lookup.email or (state.get("current_reservation") or {}).get("email")
-
-    if not email:
-        return {"response": "Please share your email address..."}
-
-    result = view_reservation_tool(reservation_id=lookup.reservation_id,
-                                   requester_email=email)
-
-    if isinstance(result, dict) and "reservation_list" in result:
-        return {
-            "response": f"Here are your reservations:\n{result['summary']}",
-            "reservation_list": result["reservation_list"]
-        }
-    response = result
+def tool_node(state):
+    if intent == "create_reservation":
+        data = state["reservation_data"]
+        ask = _missing_fields_response(data)
+        if ask:
+            return {"response": ask}   # asks for missing fields, exits
+        # validate room type, dates
+        result = create_reservation_tool(...)
+        return {"response": result["message"], "reservation_id": result["reservation_id"]}
 ```
 
-`_extract_lookup_info` looks at the **current query only** (not history) for a reservation ID. This is intentional — without this restriction, it would pick up IDs from earlier messages (e.g. "Cancel reservation 61" would pollute a subsequent "View my reservation").
+`_missing_fields_response()` checks all 5 required fields. Returns a natural language question listing only what's still missing. Returns `None` when all fields are present (booking proceeds).
 
-The email fallback chain: current message → `current_reservation` (which the server injected with `user_email`) → ask the user.
-
-### `_missing_fields_response` — Booking Prompt
+### `tool_node` — cancel_reservation path
 
 ```python
-_FIELD_LABELS = {
-    "guest_name":     "your full name",
-    "email":          "your email address",
-    "room_type":      "the room type (e.g. Standard, Deluxe, Suite)",
-    "check_in_date":  "your check-in date",
-    "check_out_date": "your check-out date",
-}
-
-def _missing_fields_response(data: dict) -> str | None:
-    missing = [label for field, label in _FIELD_LABELS.items() if not data.get(field)]
-    if not missing:
-        return None
-    if len(missing) == 1:
-        return f"Sure! Could you also share {missing[0]} so I can complete your booking?"
-    listed = ", ".join(missing[:-1]) + f" and {missing[-1]}"
-    return f"I'd love to help you book a room! Could you please share {listed}?"
+elif intent == "cancel_reservation":
+    lookup = _extract_lookup_info(query, chat_history)   # LLM extracts ID from current msg
+    # ...
+    if lookup.reservation_id is None and email:
+        # No ID given — list all active reservations
+        # If only 1: show details + "Are you sure? Yes/No"
+        # If multiple: list them all + "Which ID?"
+        return {"response": ..., "pending_cancel": {"reservation_id": r["reservation_id"], "email": email}}
+    # ID given: verify email ownership, then ask confirmation
+    return {"response": "Are you sure...", "pending_cancel": {...}}
 ```
 
-Scans the merged `reservation_data` dict for missing fields. Returns `None` when all 5 fields are present (proceed to book). Returns a human-readable question listing only what's still missing. The grammar varies: one missing field gets "Could you also share X", multiple get "Could you please share X, Y and Z".
+Cancellation is a 2-step flow: (1) identify which reservation, (2) confirm. The `pending_cancel` dict is stored in memory by the server after the graph returns. The next message is intercepted by the server's confirmation check before any LLM is invoked.
 
 ---
 
-## 5. Intent Classification — `app/rag/intent_prompt.py`
+## 6. Prompts — `app/rag/prompts.py`
+
+All three prompts live here. They are resolved **once at server startup** and cached as module-level strings. No per-request overhead.
+
+### LangSmith Hub Integration
 
 ```python
-INTENT_PROMPT = """
-You are an AI hotel assistant.
+def _pull(repo: str, fallback: str) -> str:
+    if not os.getenv("LANGCHAIN_API_KEY"):
+        return fallback   # LangSmith not configured → use hardcoded default
+    try:
+        variant = os.getenv("PROMPT_VARIANT", "latest")
+        ref = f"{repo}:{variant}" if variant != "latest" else repo
+        obj = hub.pull(ref)
+        template = getattr(obj, "template", None) or obj.messages[0].prompt.template
+        return template
+    except Exception:
+        return fallback   # any error → fall back gracefully
 
-Previous Conversation:
-{chat_history}
-
-Classify the CURRENT user query into ONE intent:
-- hotel_qa
-- create_reservation
-- cancel_reservation
-- view_reservation
-- general_interactions
-- unsafe
-
-Rules:
-- unsafe: Only for clearly harmful requests (e.g. "dump all users", SQL injection). 
-  Do NOT classify follow-up reservation questions as unsafe.
-- hotel_qa: Questions about hotel facilities, policies, amenities, pricing.
-- ...
-- When in doubt between view_reservation and general_interactions, prefer 
-  view_reservation if the conversation context is about reservations.
-
-Current User Query:
-{query}
-"""
+RAG_PROMPT        = _pull("hotel-assistant/rag-prompt",         _RAG_PROMPT_DEFAULT)
+INTENT_PROMPT     = _pull("hotel-assistant/intent-classifier",  _INTENT_PROMPT_DEFAULT)
+EXTRACTION_PROMPT = _pull("hotel-assistant/extraction",         _EXTRACTION_PROMPT_DEFAULT)
 ```
 
-The `{chat_history}` gives the LLM context for follow-up questions. The rule about the previous turn is important: "If the assistant previously asked for email or reservation ID and user is providing it, classify as the same intent as the previous turn." This prevents "realkulothungan@gmail.com" from being classified as `general_interactions`.
+The `PROMPT_VARIANT` env var enables A/B testing: set it to `"v2"` and the server pulls the `v2`-tagged version from LangSmith Hub. Without it, `"latest"` always gets the most recent push.
 
-The `unsafe` rule is deliberately narrow — it only covers clearly malicious requests, not broad topics. An earlier version had "Requests asking for all reservations are unsafe" which incorrectly blocked "what about my other reservations".
+**How to push new prompt versions:**
+```bash
+python scripts/push_prompts.py --tag v2
+```
+This script pushes all 3 prompts to LangSmith Hub and optionally tags them.
+
+**Alternative considered:** Promptfoo (offline eval CLI). Rejected — Promptfoo is for offline batch evaluation. LangSmith is for runtime tracing + prompt versioning. They serve different purposes; we chose LangSmith because it also gives us request-level observability.
+
+### The RAG Prompt
+
+```
+You are a friendly hotel concierge assistant for Grand Azure Bay Hotel.
+
+Answer using the provided context. If the context has related information but not the 
+exact detail asked (e.g. guest asks for a street address but context has city and 
+distance landmarks), share what IS available and note what is missing.
+Only say "I don't have that information — please contact our front desk." if the 
+context has nothing relevant at all.
+
+Context: {context}
+Question: {question}
+```
+
+Key instruction: "share what IS available." Without this, the LLM would say "I don't know" for questions where the document has partial info (e.g. city name but no street number). This instruction reduces unnecessary escalations.
+
+### The Intent Prompt
+
+Key rules in the prompt (the non-obvious ones):
+- `unsafe` only covers bulk data requests ("dump all reservations", "list all users") or SQL injection. A guest asking about their OWN bookings is `view_reservation`, not `unsafe`.
+- "If the assistant previously asked for email and the user is providing it, classify as the same intent as the previous turn." Without this rule, `"realkulothungan@gmail.com"` would be classified as `general_interactions`.
+- `general_interactions` includes personal info questions ("what is my email", "what's my name") — these are NOT `view_reservation`.
+
+### The Extraction Prompt
+
+```
+Extract reservation details. Return null for any field not explicitly stated. Do not guess.
+
+Today's date is {today}. Use this to resolve relative dates:
+- "tomorrow" = one day after today
+- "next Monday" = the coming Monday
+
+Important: A duration alone ("2 days", "a week") without an explicit start date does NOT 
+tell you when check-in is. Return null for both check_in_date and check_out_date in that case.
+```
+
+The duration rule was added after observing the LLM inferring `check_in=today, check_out=today+2` from "I want to book for 2 days." This silently bypassed the missing-fields check and created a booking with incorrect dates.
 
 ---
 
-## 6. RAG Pipeline
+## 7. RAG Pipeline
 
 ### Concept
 
-RAG = Retrieval Augmented Generation. Instead of asking the LLM to answer from memory (which can hallucinate), you:
-1. Convert your document into searchable chunks stored in a vector database
+RAG (Retrieval Augmented Generation): instead of asking the LLM to answer from training memory (which can hallucinate), you:
+1. Convert documents into searchable vector chunks stored in FAISS
 2. When a question arrives, find the most relevant chunks
-3. Give those chunks to the LLM as context along with the question
+3. Give those chunks to the LLM as context
 4. The LLM answers only from the provided context
 
 ### Ingestion — `app/rag/ingest.py`
 
+Run once at Docker build time (`RUN python -m app.rag.ingest` in Dockerfile). Locally, run manually after updating the PDF.
+
+The ingestion uses a **heading-aware section splitter** instead of the standard `RecursiveCharacterTextSplitter`:
 ```python
-loader = PyPDFLoader("doc/hotel_rag_document_v2.pdf")
-documents = loader.load()
+_HEADING_RE = re.compile(r'^[A-Z][^\n]{3,59}$')   # 4–60 chars, starts with capital, no terminal punct
 
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-chunks = text_splitter.split_documents(documents)
-
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-vectorstore = FAISS.from_documents(chunks, embeddings)
-vectorstore.save_local("faiss_index")
-
-# Clear cache so stale answers don't persist after knowledge base update
-from app.cache.store import rag_cache
-rag_cache.clear()
+def _parse_sections(pages):
+    # Splits on headings detected by regex
+    # Each section = heading text + body text until next heading
+    # Result: 15 semantically coherent sections
 ```
 
-- `chunk_size=500` — each chunk is at most 500 characters. Smaller chunks are more precise; larger chunks give more context. 500 is a common balance.
-- `chunk_overlap=100` — consecutive chunks share 100 characters. This prevents a sentence that spans a boundary from being split and losing meaning.
-- `sentence-transformers/all-MiniLM-L6-v2` — a 22MB HuggingFace model that converts text to 384-dimensional vectors. Free, fast, runs locally. OpenAI embeddings would be more accurate but cost money per token.
-- FAISS (Facebook AI Similarity Search) — stores the vectors and supports fast nearest-neighbour lookup.
+**Alternative considered:** `RecursiveCharacterTextSplitter(chunk_size=500, overlap=100)`. Tested but rejected — it splits mid-sentence at arbitrary character counts, breaking semantic coherence. The heading-aware splitter keeps "Dining Experience" with all its dining content in one chunk.
+
+The embedding model is `sentence-transformers/all-MiniLM-L6-v2`:
+- 22MB, runs locally, no API cost
+- 384-dimensional vectors
+- **Alternative considered:** `text-embedding-3-small` (OpenAI). More accurate but costs money per token and requires an API call at query time. The local model is fast enough for a 15-section knowledge base.
+
+After rebuilding, the script also calls `rag_cache.clear()` so stale cached answers don't persist.
 
 ### Retriever — `app/rag/retriever.py`
 
@@ -688,73 +756,52 @@ vectorstore = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deseri
 retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 ```
 
-`k=3` means return the 3 most similar chunks. When `retriever.invoke("what is the check-in time?")` is called:
-1. The query is converted to a 384-d vector using the same embedding model
-2. FAISS finds the 3 stored chunk-vectors closest to it (cosine similarity)
-3. Returns the original text of those chunks
+`k=3` returns the 3 most similar chunks by cosine similarity. When `retriever.invoke("what is check-in time?")` is called:
+1. Query is embedded into a 384-d vector
+2. FAISS finds the 3 stored vectors closest by cosine similarity
+3. Returns original text of those chunks
 
-`allow_dangerous_deserialization=True` is required for loading FAISS indices from disk — it's a safety flag because deserialising pickled data can be risky with untrusted files, but here we built the index ourselves.
-
-### RAG Prompt — `app/rag/prompts.py`
-
-```python
-RAG_PROMPT = """
-You are a friendly hotel concierge assistant for Grand Azure Bay Hotel.
-
-Answer using the provided context. If the context has related information but not the 
-exact detail asked (e.g. guest asks for a street address but context has city and 
-distance landmarks), share what IS available and note what is missing.
-Only say "I don't have that information — please contact our front desk." if the 
-context has nothing relevant at all.
-
-Context:
-{context}
-
-Question:
-{question}
-"""
-```
-
-The key instruction is "share what IS available" — without this, the LLM would say "I don't know" when asked for the hotel address because the document has a city name but no street number. With this instruction, it says "Our hotel is in Elysian Coast City, 5 km from the city center."
+`allow_dangerous_deserialization=True` is required for loading FAISS from disk (it uses pickle). This is safe here because the index is self-generated at build time from our own PDF, not from user input.
 
 ---
 
-## 7. Smart Cache — `app/cache/store.py`
+## 8. Smart Cache — `app/cache/store.py`
 
 ```python
 rag_cache = diskcache.Cache(".rag_cache", statistics=True)
+```
 
-_FALLBACK_PHRASES = [
-    "i don't have that information",
-    "please contact our front desk",
-    "i could not find that information",
-]
+`diskcache` stores cache entries on disk. Unlike in-memory caching, it survives server restarts and is bounded in size. `statistics=True` tracks hits/misses — the `/metrics/cache` and `/metrics/health` endpoints expose these counts.
 
+**Alternative considered:** `functools.lru_cache`. Rejected — in-memory only (resets on restart), no TTL support, no statistics.
+
+**Alternative considered:** Redis for caching too. Rejected — overkill. diskcache is simpler and the cache data (LLM responses) is larger than session data; disk is appropriate.
+
+```python
 def make_cache_key(query: str) -> str:
     normalized = re.sub(r"[^\w\s]", "", query.lower().strip())
     normalized = re.sub(r"\s+", " ", normalized)
     return hashlib.md5(normalized.encode()).hexdigest()
-
-def is_cacheable(response: str) -> bool:
-    lower = response.lower()
-    return not any(phrase in lower for phrase in _FALLBACK_PHRASES)
 ```
 
-Three design decisions here:
+Normalisation before hashing: strips punctuation, lowercases, collapses whitespace. "What's the check-in time?" and "what is check in time" produce the same MD5 key.
 
-**`statistics=True`** — enables hit/miss tracking. You can call `rag_cache.stats()` to get `(hits, misses)` counts. The `/metrics/health` endpoint exposes this as a cache hit rate percentage.
+```python
+_FALLBACK_PHRASES = ["i don't have that information", "please contact our front desk", ...]
 
-**`make_cache_key()`** — normalisation before hashing means:
-- "What's the check-in time?" → `whats the checkin time` → same MD5 as "what is check in time"
-- Prevents duplicate cache entries for semantically identical questions
+def is_cacheable(response: str) -> bool:
+    return not any(phrase in response.lower() for phrase in _FALLBACK_PHRASES)
+```
 
-**`is_cacheable()`** — the quality guard. If the LLM couldn't answer (fallback response), we don't cache it. Next time someone asks the same question, the LLM gets another chance — maybe the retriever will find better context. A bad cached answer is permanent; an LLM call is just slow.
+Quality gate: never cache a fallback response. If the bot couldn't answer, the next identical question should hit the LLM again (the retriever might find better context on a fresh run, or the knowledge base may have been updated).
+
+**Cache TTL:** 86400 seconds (24 hours), set in `save_rag_response()`.
 
 ---
 
-## 8. Tools — `app/tools/reservation_tools.py`
+## 9. Tools — `app/tools/reservation_tools.py`
 
-### `_is_active()`
+### `_is_active(r: dict) -> bool`
 
 ```python
 def _is_active(r: dict) -> bool:
@@ -767,35 +814,34 @@ def _is_active(r: dict) -> bool:
         return False
 ```
 
-A reservation is "active" only if: (1) not cancelled, AND (2) check-out is today or in the future. The try/except handles malformed dates (like the 1717 date from an earlier hallucination bug) — it returns False instead of crashing.
+A reservation is active if: (1) status is CONFIRMED (not CANCELLED), AND (2) check-out date is today or in the future. The `try/except` handles malformed date strings defensively — returns False instead of crashing the entire listing operation.
+
+### `create_reservation_tool()`
+
+Checks for conflicting existing reservations before inserting:
+```python
+existing = get_reservations_by_email(email)
+for r in existing:
+    if r["status"] == "CONFIRMED":
+        r_in = date.fromisoformat(str(r["check_in_date"]))
+        r_out = date.fromisoformat(str(r["check_out_date"]))
+        if check_in < r_out and check_out > r_in:   # overlap detection
+            return {"message": "You already have a reservation for those dates...", "reservation_id": None}
+```
+
+The overlap condition `check_in < r_out and check_out > r_in` is the standard interval overlap test.
 
 ### `view_reservation_tool()`
 
-```python
-def view_reservation_tool(reservation_id, requester_email):
-    if reservation_id is None and requester_email:
-        # Email-only path: show all active reservations
-        reservations = get_reservations_by_email(requester_email)
-        active = [r for r in reservations if _is_active(r)]
-        if not active:
-            return "You have no upcoming reservations..."
-        lines = [format each as markdown...]
-        return {"reservation_list": active, "summary": "\n\n".join(lines)}
+Two modes:
+1. `reservation_id is None and email` — list all active reservations by email
+2. `reservation_id and email` — get specific reservation, verify email ownership
 
-    # Single reservation path: ownership verified by email
-    reservation = get_reservation(reservation_id)
-    if not reservation:
-        return "Reservation not found."
-    if reservation["email"].lower() != requester_email.lower():
-        return "Access denied. This reservation does not belong to your email."
-    # format and return
-```
-
-Two modes: email-only (show all active) vs reservation-ID + email (show specific, verify ownership). The ownership check (`email != requester_email`) is the security boundary — without it, anyone knowing a reservation ID could view or cancel it.
+Email ownership check: `reservation["email"].lower() != requester_email.lower()`. Lowercased comparison — the DB stores whatever case the user typed, so "User@Hotel.com" and "user@hotel.com" must compare equal.
 
 ---
 
-## 9. Database — `app/db/`
+## 10. Database — `app/db/`
 
 ### Connection — `app/db/database.py`
 
@@ -804,164 +850,255 @@ DATABASE_NAME = os.getenv("DATABASE_PATH", "hotel.db")
 
 def get_connection():
     conn = sqlite3.connect(DATABASE_NAME)
-    conn.row_factory = sqlite3.Row
+    conn.row_factory = sqlite3.Row    # rows behave like dicts: row["email"] instead of row[2]
     return conn
 ```
 
-`sqlite3.Row` makes query results behave like dicts — `row["email"]` instead of `row[2]`. The `DATABASE_PATH` env var allows different paths in different environments (local `hotel.db`, HF Spaces persistent storage path).
+`DATABASE_PATH` env var allows different paths per environment. HF Spaces uses a persistent volume mounted at a fixed path; locally it's `hotel.db` in the working directory.
 
-### Schema — `app/db/models.py`
+Every `get_connection()` call opens a new connection. The `finally: conn.close()` pattern in every operation function ensures connections are always closed, preventing connection leaks. This is appropriate for SQLite (which serialises writes anyway); a PostgreSQL setup would use a connection pool.
 
-```sql
-CREATE TABLE IF NOT EXISTS reservations (
-    reservation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    guest_name TEXT NOT NULL,
-    email TEXT NOT NULL,
-    room_type TEXT NOT NULL,
-    check_in_date TEXT NOT NULL,
-    check_out_date TEXT NOT NULL,
-    status TEXT DEFAULT 'CONFIRMED',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
+### Migrations — `migrations/versions/e84fb6801694_initial_schema.py`
 
-CREATE TABLE IF NOT EXISTS escalations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id TEXT NOT NULL,
-    guest_email TEXT,
-    query TEXT NOT NULL,
-    status TEXT DEFAULT 'PENDING',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
+```python
+def upgrade() -> None:
+    op.create_table("reservations",
+        sa.Column("reservation_id", sa.Integer, primary_key=True, autoincrement=True),
+        sa.Column("guest_name", sa.Text, nullable=False),
+        sa.Column("email", sa.Text, nullable=False),
+        sa.Column("room_type", sa.Text, nullable=False),
+        sa.Column("check_in_date", sa.Text, nullable=False),   # ISO 8601 string
+        sa.Column("check_out_date", sa.Text, nullable=False),
+        sa.Column("status", sa.Text, server_default="CONFIRMED"),
+        sa.Column("created_at", sa.TIMESTAMP, server_default=sa.text("CURRENT_TIMESTAMP")),
+    )
+    op.create_table("escalations", ...)
+
+def downgrade() -> None:
+    op.drop_table("escalations")
+    op.drop_table("reservations")
 ```
 
-Dates are stored as `TEXT` (ISO format: `2026-05-19`). This is a common SQLite pattern since SQLite has no native date type. The `_is_active()` function parses them back with `date.fromisoformat()`.
+Dates stored as `TEXT` (ISO format) because SQLite has no native date type. Alembic tracks which migrations have run in the `alembic_version` table — calling `upgrade("head")` on an already-migrated DB is a safe no-op.
+
+**Alternative considered:** Raw `CREATE TABLE IF NOT EXISTS` in models.py. Was the original implementation. Replaced with Alembic because `IF NOT EXISTS` can't handle schema changes (adding columns, indexes) to existing tables. Alembic generates an upgrade/downgrade script for every schema change.
+
+### Operations — `app/db/operations.py`
+
+All SQL is parameterised with `?` placeholders — never string-interpolated. This prevents SQL injection entirely. The `LOWER(email) = LOWER(?)` in `get_reservations_by_email()` handles case-insensitive lookup at the DB level.
 
 ---
 
-## 10. LLM Provider — `app/llm/provider.py`
+## 11. Schemas — `app/schemas/`
+
+### `ChatRequest`
 
 ```python
-class FallbackLLM:
-    def __init__(self):
-        self.primary_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, max_tokens=1024)
-        if _has_groq and os.getenv("GROQ_API_KEY"):
-            self.fallback_llm = ChatGroq(model="llama-3.1-8b-instant", ...)
-        else:
-            self.fallback_llm = None
+class ChatRequest(BaseModel):
+    conversation_id: str
+    query: str
+    user_email: Optional[str] = None
 ```
 
-`temperature=0` means deterministic output — the model always picks the highest-probability token, no randomness. This is important for structured extraction and intent classification where you want consistent results.
+Note: `query` has no length constraints (BUG-08 in BACKLOG.md — a known gap). Should be `Field(..., min_length=1, max_length=4000)`.
 
-`max_tokens=1024` caps response length. Without this, the `with_structured_output()` call for reservation extraction was hitting 16,384 tokens (the model's max) when something went wrong, causing a `LengthFinishReasonError`.
+### `IntentOutput`
 
 ```python
-    def with_structured_output(self, schema):
-        return self.primary_llm.with_structured_output(schema)
+class IntentOutput(BaseModel):
+    intent: str
 ```
 
-`with_structured_output()` is a LangChain method that tells the LLM to respond with JSON matching a Pydantic schema. Under the hood it uses OpenAI's function-calling / response-format API. The model is forced to produce valid JSON — it cannot respond with freeform text.
+Note: `intent` accepts any string (BUG-09 in BACKLOG.md). Should be `Literal["hotel_qa", "create_reservation", ...]` to reject hallucinated intent names at the Pydantic level.
+
+### `ReservationData`
 
 ```python
-    async def astream(self, prompt):
-        try:
-            async for chunk in self.primary_llm.astream(prompt):
-                yield chunk
-        except Exception as e:
-            if self.fallback_llm:
-                result = self.fallback_llm.invoke(prompt)
-                yield result
-            else:
-                raise
+class ReservationData(BaseModel):
+    guest_name: Optional[str] = None
+    email: Optional[str] = None
+    room_type: Optional[str] = None
+    check_in_date: Optional[date] = None
+    check_out_date: Optional[date] = None
 ```
 
-`astream` is the async generator version — it yields chunks as the LLM produces them. This is what powers the streaming endpoint. On failure, it falls back to a synchronous Groq call and yields the full result as one chunk (graceful degradation — no streaming but still functional).
+All fields optional. The extraction LLM fills what it can; nulls mean "not yet provided." The merge logic in `extract_reservation_node` accumulates non-null values across turns.
 
 ---
 
-## 11. Logging — `app/utils/logger.py`
+## 12. Logging — `app/utils/logger.py`
 
 ```python
+request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="")
+
 class _JsonFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        payload = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created)),
-            "level": record.levelname,
-            "msg": record.getMessage(),
-        }
+    def format(self, record):
+        payload = {"ts": ..., "level": ..., "msg": ...}
+        rid = request_id_var.get()
+        if rid:
+            payload["request_id"] = rid    # injected into every log line in this request
         for key, val in record.__dict__.items():
             if key not in _SKIP_KEYS and not key.startswith("_"):
-                payload[key] = val
+                payload[key] = val         # any extra= fields from logger.info(...)
         return json.dumps(payload)
 ```
 
-Every log line is a JSON object. This is the standard for production logging because JSON is machine-parseable — log aggregation tools (Datadog, CloudWatch, Grafana Loki) can query fields like `latency_ms > 3000` or `intent = "hotel_qa"`.
+Every log line is structured JSON. Fields from `logger.info("msg", extra={"intent": "hotel_qa"})` appear as top-level keys. Production log aggregators (Datadog, CloudWatch Insights, Grafana Loki) can query on any field.
 
-The `extra={}` pattern used in server.py:
+`request_id_var` is set by `RequestIdMiddleware` at the start of each request and reset in `finally`. Any code that calls `logger.*` during that request automatically gets `request_id` in its output, enabling full request tracing without passing the ID explicitly through function arguments.
+
+---
+
+## 13. PII Scrubbing — `app/utils/pii.py`
+
 ```python
-logger.info("intent_classified", extra={"intent": "hotel_qa", "prompt_tokens": 45})
-```
-→ produces:
-```json
-{"ts": "2026-05-18T...", "level": "INFO", "msg": "intent_classified", "intent": "hotel_qa", "prompt_tokens": 45}
+_EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
+_PHONE_RE = re.compile(r'\+?\d[\d\s\-().]{7,}\d')
+
+def scrub_pii(text: str) -> str:
+    text = _EMAIL_RE.sub('[EMAIL]', text)
+    text = _PHONE_RE.sub('[PHONE]', text)
+    return text
 ```
 
-The `_SKIP_KEYS` set filters out Python's internal `LogRecord` attributes that aren't meaningful for our purposes.
+Applied in `build_rag_prompt()` and `build_general_prompt()` before the query is sent to the LLM. Email addresses and phone numbers are replaced with placeholders. This prevents PII from appearing in LangSmith traces and LLM provider logs.
+
+**Not applied to:** structured output prompts (intent classification, extraction). Those prompts deliberately need the email to extract it as a field.
 
 ---
 
-## 12. Escalation Flow
+## 14. Escalation Flow
 
-When the bot can't answer ("I don't have that information"):
+When the bot says "I don't have that information — please contact our front desk":
 
-1. **Frontend** detects the phrase in the reply, sets `st.session_state.escalate_query = query`
-2. **UI** renders "Ask a Human" button
-3. **User clicks** → frontend POSTs to `/escalate`:
+1. Frontend detects the phrase in `reply` → sets `st.session_state.escalate_query = query`
+2. On next rerun, an "Ask a Human" button renders
+3. User clicks → frontend POSTs to `POST /escalate`:
    ```json
-   {"conversation_id": "...", "query": "What are room rates?", "guest_email": "..."}
+   {"conversation_id": "...", "query": "What are the room rates?", "guest_email": "..."}
    ```
-4. **Server** calls `create_escalation()` → writes to `escalations` table with `status='PENDING'`
-5. **Hotel staff** hit `GET /admin/escalations` to see pending queries
-6. **Staff** hit `PATCH /admin/escalations/{id}/resolve` after responding to the guest
+4. Server writes to `escalations` table with `status='PENDING'`
+5. Hotel staff: `GET /admin/escalations` → see all pending queries
+6. Staff: `PATCH /admin/escalations/{id}/resolve` → sets `status='RESOLVED'`
+
+**Known gap (FEAT-06 in BACKLOG.md):** No staff notification (email/webhook) on escalation creation. An escalation can sit unread indefinitely. The admin endpoint requires staff to poll manually.
 
 ---
 
-## 13. End-to-End Flow: "Cancel my reservation"
+## 15. CI/CD & Deployment
 
-To cement everything, here's a full trace of one request:
+### Branches and Environments
 
-1. **Frontend** — user types "Cancel my reservation", `send("Cancel my reservation")` is called
-2. **Frontend** — `requests.post("/chat/stream", json={query, conversation_id, user_email})`
-3. **Server** — `_get_or_init_memory()` returns existing session (has `user_email`)
-4. **Server** — injects email into `current_reservation = {"email": "guest@x.com"}`
-5. **Server** — intent classification LLM call → `intent = "cancel_reservation"`
-6. **Server** — not `hotel_qa` or `general_interactions` → calls `graph.invoke()`
-7. **Graph** — enters `intent_router_node` → `state.get("intent")` is already set → returns `{}`
-8. **Graph** — `route_intent` returns `"tool_node"` (for cancel_reservation)
-9. **tool_node** — `_extract_lookup_info("Cancel my reservation", history)` → no ID in current message → `reservation_id = None`
-10. **tool_node** — `email = current_reservation.get("email")` = "guest@x.com" ✓
-11. **tool_node** — `reservation_id is None and email` → calls `get_reservations_by_email()`
-12. **tool_node** — filters with `_is_active()` → 3 confirmed future reservations
-13. **tool_node** — returns formatted list + "Which reservation would you like to cancel?"
-14. **Server** — streams response back as single chunk
-15. **Frontend** — `reply` contains "Here are your reservations: #61, #62, #63..."
-16. **Frontend** — `_is_cancel_query("Cancel my reservation")` = True → `cancel_res_ids = [61, 62, 63]`
-17. **Frontend** — on next rerun, renders "Cancel Reservation #61/62/63" buttons
-18. **User clicks** "Cancel Reservation #62" → `pending_query = "Cancel reservation 62"`
-19. **send("Cancel reservation 62")** → API → graph → `_extract_lookup_info` finds `reservation_id=62`
-20. **tool_node** → `cancel_reservation_tool(62, "guest@x.com")` → verifies email, updates DB, returns success
+| Branch | Purpose | HF Space |
+|---|---|---|
+| `master` | Production | `grand-azure-bay-api` (backend), `grand-azure-bay` (frontend) |
+| `dev` | Development/staging | `grand-azure-bay-api-dev` (backend), `grand-azure-bay-dev-staging` (frontend) |
+| `hf-backend` | Production backend sync branch | — |
+| `hf-frontend` | Production frontend sync branch | — |
+| `hf-backend-dev` | Dev backend sync branch | — |
+| `hf-frontend-dev` | Dev frontend sync branch | — |
+
+### Sync Workflow Pattern (both `sync-hf-spaces.yml` and `sync-hf-spaces-dev.yml`)
+
+```yaml
+- name: Merge master/dev into hf-backend/hf-backend-dev and push to HF
+  run: |
+    git fetch origin
+    git checkout hf-backend-dev
+    git merge origin/dev --no-edit -X ours     # our changes win on conflict
+    git push origin hf-backend-dev             # update GitHub branch
+    git remote add hf https://...:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/...
+    git push hf hf-backend-dev:main --force    # push to HF Space's main branch
+```
+
+The `hf-backend` / `hf-backend-dev` branches exist as staging areas. HF Spaces deploy from their `main` branch. We force-push our sync branch to HF's `main`.
+
+`-X ours` on merge means "if there's a merge conflict, our (sync branch) version wins." This prevents HF-side auto-generated files from blocking the merge.
+
+### Dockerfile
+
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+RUN python -m app.rag.ingest    # builds faiss_index/ at image build time
+EXPOSE 7860
+CMD ["uvicorn", "app.api.server:app", "--host", "0.0.0.0", "--port", "7860"]
+```
+
+The FAISS index is built during `docker build`, not at startup. This keeps startup time short (no embedding model download at boot). The index is baked into the image.
+
+**Port:** 7860 is the HF Spaces convention. `docker-compose.yml` maps `8000:7860` so `http://localhost:8000` works locally.
+
+**Known gap (SEC-07 in BACKLOG.md):** No `USER` directive — container runs as root.
+
+### Environment Variables
+
+| Variable | Where set | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` | HF Space Secret / `.env` | Primary LLM |
+| `GROQ_API_KEY` | HF Space Secret / `.env` | Fallback LLM |
+| `REDIS_URL` | HF Space Variable / `.env` | Session store (in-memory if unset) |
+| `CONV_TTL_SECONDS` | Optional | Redis TTL (default 86400) |
+| `LANGCHAIN_API_KEY` | HF Space Secret / `.env` | Enables LangSmith tracing + Hub pull |
+| `LANGCHAIN_TRACING_V2` | `.env.example` | Must be `true` alongside API key |
+| `PROMPT_VARIANT` | HF Space Variable / `.env` | Hub version tag (default: `latest`) |
+| `LOG_LEVEL` | Optional | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
+| `DATABASE_PATH` | HF Space Variable | SQLite file path (persistent volume) |
+| `API_URL` | Frontend HF Space Secret | Backend URL for the Streamlit app |
 
 ---
 
-## Key Numbers to Remember
+## 16. End-to-End Trace: "I want to book a Deluxe room"
 
-| Thing | Value |
-|---|---|
-| LLM model | gpt-4o-mini |
-| Embedding model | all-MiniLM-L6-v2 (22MB, local) |
-| RAG chunks | 500 chars, 100 overlap |
-| Retriever top-k | 3 chunks |
-| Cache TTL | 24 hours |
-| Max LLM tokens | 1024 |
-| Session store | In-memory dict (resets on restart) |
-| DB | SQLite (`hotel.db`) |
-| Intents | 6: hotel_qa, create_reservation, view_reservation, cancel_reservation, general_interactions, unsafe |
+1. User types in browser → `send("I want to book a Deluxe room")` in `frontend/app.py`
+2. Frontend POSTs to `/chat/stream` with `{conversation_id, query, user_email}`
+3. **Server:** `_get_or_init_memory()` returns/creates session dict
+4. **Server:** user message appended to `chat_history`
+5. **Server:** `user_email` from payload stored in `memory["user_email"]`; injected into `current_reservation`
+6. **Server:** no `pending_cancel` → skip confirmation intercept
+7. **Server:** intent classification LLM call → `intent = "create_reservation"`
+8. **Server:** not `hotel_qa` or `general_interactions` → `graph.invoke({..., intent: "create_reservation", ...})`
+9. **Graph:** `intent_router_node` → `state.get("intent")` is set → `return {}` (no LLM call)
+10. **Graph:** `route_intent` → `"extract_reservation"`
+11. **Graph:** `extract_reservation_node` → no existing reservation → LLM extracts from current message only
+    - LLM output: `{guest_name: null, email: null, room_type: "Deluxe", check_in_date: null, check_out_date: null}`
+    - `email` injected from `current_reservation`: `{..., email: "guest@x.com"}`
+12. **Graph:** `tool_node` → `_missing_fields_response({room_type: "Deluxe", email: "guest@x.com"})` → missing: `guest_name, check_in_date, check_out_date` → returns "Could you please share your full name, check-in date and check-out date?"
+13. **Server:** `current_reservation` updated with partial data: `{room_type: "Deluxe", email: "guest@x.com"}`
+14. **Server:** `_append_assistant_reply()` → saves to Redis/memory
+15. **Server:** `StreamingResponse` yields the ask string
+16. **Frontend:** `_is_booking_ask("could you please share your full name")` → "full name" in text → `show_booking_form = True`
+17. **Frontend:** booking form renders (name input, room type dropdown pre-selectable, date pickers)
+18. User fills form: name="Kulothungan", room_type="Deluxe", check_in="2026-05-25", check_out="2026-05-27"
+19. Form submit → `pending_query = "Book a room for Kulothungan, email guest@x.com, room type Deluxe, check-in 2026-05-25, check-out 2026-05-27"`
+20. `st.rerun()` → `send(pending_query)`
+21. **Server:** same flow → extraction → all 5 fields present → `create_reservation_tool(...)` → DB insert → `reservation_id = 7`
+22. **Frontend:** reply contains "Reservation ID: 7" → regex extracts `7` → green pill rendered
+
+---
+
+## 17. Key Numbers and Constants
+
+| Thing | Value | Where |
+|---|---|---|
+| Primary LLM | `gpt-4o-mini` | `app/llm/config.py` → `OPENAI_MODEL` |
+| Fallback LLM | `llama-3.1-8b-instant` (Groq) | `app/llm/provider.py` |
+| `temperature` | `0` (deterministic) | `app/llm/provider.py` |
+| `max_tokens` | `1024` | `app/llm/provider.py` |
+| Embedding model | `all-MiniLM-L6-v2` (22MB, local) | `app/rag/retriever.py`, `app/rag/ingest.py` |
+| Vector dimensions | 384 | (model property) |
+| RAG top-k | 3 chunks | `app/rag/retriever.py` |
+| Cache TTL | 86400s (24 hours) | `app/graph/nodes.py:save_rag_response` |
+| Session TTL | 86400s (24 hours) | `app/memory/store.py:_CONV_TTL` |
+| History window | 6 messages (3 turn-pairs) | `app/api/server.py:_HISTORY_WINDOW` |
+| Circuit breaker threshold | 3 failures | `app/llm/provider.py:_FAILURE_THRESHOLD` |
+| Circuit recovery timeout | 30 seconds | `app/llm/provider.py:_RECOVERY_TIMEOUT` |
+| Server port | 7860 (container) / 8000 (host) | `Dockerfile` / `docker-compose.yml` |
+| Frontend port | 8501 | `docker-compose.yml` |
+| Intents | 6: hotel_qa, create_reservation, view_reservation, cancel_reservation, general_interactions, unsafe | `app/rag/prompts.py` |
+| Valid room types | Standard, Deluxe, Suite | `app/graph/nodes.py:_VALID_ROOM_TYPES` |
+| DB | SQLite (`hotel.db` or `DATABASE_PATH`) | `app/db/database.py` |
+| Drift alert threshold | 10 percentage-point shift | `app/api/server.py:metrics_drift` |
